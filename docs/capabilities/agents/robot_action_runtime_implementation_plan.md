@@ -26,7 +26,7 @@ Progress legend: `[ ]` not started, `[x]` complete. If work is partially complet
 
 - [ ] The specification's prototype acceptance criteria all pass.
 - [ ] The built-in prototype dispatch path is native and does not make localhost MCP HTTP calls.
-- [ ] Existing MCP clients and uncontracted skills remain backward compatible.
+- [ ] Existing MCP clients and ordinary uncontracted tools retain their standard schemas, call IDs, dispatch behavior, and result messages.
 - [ ] Unit, component, process-integration, recovery, and replay end-to-end tests pass without hardware or a live model.
 - [ ] No physical action is dispatched before its journal intent commit.
 - [ ] No physical resource is released before verified termination or explicit unknown-state escalation.
@@ -37,7 +37,7 @@ Progress legend: `[ ]` not started, `[x]` complete. If work is partially complet
 
 The prototype implements:
 
-- `QUERY`, `COMPUTE`, and `PHYSICAL` skill classification.
+- Standard tool-call compatibility with optional `PhysicalActionContract` routing for managed physical skills.
 - Immutable action records and the complete action state machine.
 - SQLite mission journal, snapshot storage, hash-chain validation, and immutable-table triggers.
 - Content-addressed local artifact storage.
@@ -64,7 +64,7 @@ The target layout is listed here so implementers do not invent competing locatio
 | `dimos/agents/runtime/artifacts.py` | Content-addressed artifact protocol and local implementation |
 | `dimos/agents/runtime/snapshots.py` | Harness-owned snapshot provider, persistence, freshness comparison, and repository API |
 | `dimos/agents/runtime/snapshot_module.py` | Go2 typed-stream cache and detached observation-draft RPC |
-| `dimos/agents/runtime/contracts.py` | Contract records, resolution, and predicate/verifier registries |
+| `dimos/agents/runtime/physical_action_contracts.py` | Physical action contract records, resolution, and predicate/verifier registries |
 | `dimos/agents/runtime/leases.py` | Exclusive lease manager |
 | `dimos/agents/runtime/admission.py` | Ordered admission gates and decisions |
 | `dimos/agents/runtime/executor.py` | Native `SkillsProxy` executor and execution handle |
@@ -123,8 +123,8 @@ Goal: define immutable records and reject illegal state changes before adding st
 
 ### Green
 
-- [ ] Implement string enums for skill kind, execution mode, risk, replay policy, action state, event type, lease status, and next disposition.
-- [ ] Implement frozen records for `ActionIntent`, `RequiredObservation`, `ResourceRequest`, `SkillContract`, `PreparedAction`, `ActionEvent`, `ActionOutcome`, `TimedObservation`, `ArtifactRef`, `WorldSnapshotDraft`, `WorldSnapshot`, and `JournalEvent`.
+- [ ] Implement string enums for risk, physical-action replay policy, action state, event type, lease status, and next disposition; reuse existing `SkillInfo` lifecycle metadata rather than defining a competing execution-mode enum.
+- [ ] Implement frozen records for `ActionIntent`, `RequiredObservation`, `ResourceRequest`, `PhysicalActionContract`, `PreparedAction`, `ActionEvent`, `ActionOutcome`, `TimedObservation`, `ArtifactRef`, `WorldSnapshotDraft`, `WorldSnapshot`, and `JournalEvent`.
 - [ ] Implement explicit codec functions with schema versions. Do not persist `repr()` output or pickle.
 - [ ] Recursively freeze JSON mappings and sequences at record construction and thaw them only inside explicit codecs.
 - [ ] Implement one authoritative transition table and transition validator.
@@ -183,7 +183,7 @@ Goal: assemble versioned snapshots from asynchronous inputs and persist large pa
 - [ ] Test that capture returns a detached immutable value while new stream updates continue.
 - [ ] Test explicit missing observations; no placeholder pose, battery, or confidence is allowed.
 - [ ] Test that stale and fresh classifications use an injected monotonic clock.
-- [ ] Test that comparison examines only fields declared by a skill contract.
+- [ ] Test that comparison examines only fields declared by a physical action contract.
 - [ ] Test that equal artifact bytes deduplicate to the same SHA-256 identifier.
 - [ ] Test that artifact metadata preserves media type, byte size, source time, and digest.
 - [ ] Test that snapshot persistence stores image references rather than image bytes.
@@ -210,29 +210,31 @@ Goal: assemble versioned snapshots from asynchronous inputs and persist large pa
 - [ ] Run `uv run pytest dimos/agents/runtime/test_artifacts.py dimos/agents/runtime/test_snapshots.py dimos/agents/runtime/test_snapshot_module.py -v`.
 - [ ] Run `uv run mypy dimos/agents/runtime/artifacts.py dimos/agents/runtime/snapshots.py dimos/agents/runtime/snapshot_module.py`.
 
-## Phase 4: skill-contract discovery
+## Phase 4: physical-action-contract discovery
 
-Goal: extend skill metadata without breaking current decorators, MCP, or native discovery.
+Goal: add optional managed-physical-execution metadata without changing standard tool behavior, current decorators, MCP, or native discovery.
 
 ### Red
 
 - [ ] Test bare `@skill` retains its current schema, RPC behavior, and default metadata.
 - [ ] Test existing `@skill(uses=[...], lifecycle=...)` remains compatible.
-- [ ] Test a contracted physical skill exposes every required contract field through core `SkillInfo`.
-- [ ] Test invalid contracts fail during class or module setup, before the robot can run.
-- [ ] Test a physical contract without resources, timeout, stop handler, or verifier is rejected.
+- [ ] Test an uncontracted tool uses the ordinary dispatcher, preserves its standard tool-call ID and result message, and does not create an `ActionIntent`.
+- [ ] Test a contracted physical skill exposes every required `PhysicalActionContract` field through core `SkillInfo` without changing its model-visible tool schema.
+- [ ] Test invalid physical action contracts fail during class or module setup, before the robot can run.
+- [ ] Test a physical action contract without resources, timeout, stop handler, or verifier is rejected.
+- [ ] Test the physical action contract cannot redefine the standard tool name, description, argument schema, call ID, result envelope, or lifecycle.
 - [ ] Test the model-visible schema cannot override trusted contract metadata.
-- [ ] Test native `SkillsProxy` and MCP discovery agree on contract name and version.
-- [ ] Test uncontracted skills are marked legacy and are not accepted by the physical runner.
+- [ ] Test native and MCP dispatch resolve the same server-side physical action contract ID and version without exposing that contract in the standard model-facing schema.
+- [ ] Test only tools with a valid physical action contract can enter the physical runner.
 
 ### Green
 
-- [ ] Extend `skill()` with one optional typed contract argument while preserving both existing decorator forms.
+- [ ] Extend `skill()` with one optional typed `PhysicalActionContract` argument while preserving both existing decorator forms and standard tool-call behavior.
 - [ ] Attach the immutable contract to the RPC wrapper and include it in core `SkillInfo`.
 - [ ] Update module skill discovery and serialization for the new optional fields.
-- [ ] Update `SkillsProxy` to expose skill info to `SkillContractRegistry` without reaching into private fields.
-- [ ] Update MCP `tools/list` metadata with safe, non-executable contract fields.
-- [ ] Implement `SkillContractRegistry` with live refresh and ambiguity detection matching `SkillsProxy` behavior.
+- [ ] Update `SkillsProxy` to expose skill info to `PhysicalActionContractRegistry` without reaching into private fields.
+- [ ] Keep MCP `tools/list` output backward compatible; resolve physical action contracts only in trusted server-side dispatch.
+- [ ] Implement `PhysicalActionContractRegistry` with live refresh and ambiguity detection matching `SkillsProxy` behavior.
 - [ ] Implement named predicate, verifier, and stop-handler registries owned by the harness root.
 
 ### Refactor and acceptance
@@ -270,7 +272,7 @@ Goal: guarantee one owner for physical resources and make all pre-dispatch gates
 - [ ] Return immutable `AdmissionDecision` values with stable reason codes.
 - [ ] Journal all approval, safety, and lease transitions.
 - [ ] Add an `ActionRuntimeSpec` RPC boundary owned by the harness root. Native and MCP callers use this same boundary for contracted physical actions.
-- [ ] Update `McpServer` so contracted physical calls route through `ActionRuntimeSpec` and skip direct RPC dispatch and `CapabilityRegistry`; uncontracted legacy calls retain their existing path.
+- [ ] Update `McpServer` so contracted physical calls route through `ActionRuntimeSpec` and skip direct RPC dispatch and `CapabilityRegistry`; uncontracted calls retain their ordinary path and standard MCP responses.
 - [ ] Test that a native call and an MCP call for `base.motion` conflict through the same `LeaseManager`, proving there is no split ownership.
 
 ### Refactor and acceptance
@@ -394,10 +396,11 @@ Goal: integrate the runtime with a bounded model decision loop while keeping dur
 
 ### Red
 
-- [ ] Test a recorded `MockModel` response becomes one `ActionIntent` tied to the decision snapshot and model call ID.
-- [ ] Test query skills return structured results without taking physical leases.
+- [ ] Test a recorded `MockModel` response containing an ordinary tool call is journaled with its standard tool-call ID.
+- [ ] Test an uncontracted query tool uses the ordinary dispatcher, returns its normal structured tool result, and creates neither an `ActionIntent` nor a physical lease.
+- [ ] Test a contracted physical tool call becomes one `ActionIntent` tied to the decision snapshot and the unchanged standard tool-call ID.
 - [ ] Test physical tool wrappers call `ActionRunner`, never `SkillsProxy` directly.
-- [ ] Test tool results supplied back to the model are `ActionOutcome` projections rather than raw controller prose.
+- [ ] Test a physical `ActionOutcome` is encoded into a standard tool-result message associated with the original tool-call ID rather than returned as raw controller prose.
 - [ ] Test a safety or unknown event wakes the model only after deterministic handling completes.
 - [ ] Test routine progress does not trigger an LLM turn.
 - [ ] Test user steering can cancel a model turn without falsely marking a robot action stopped.
@@ -406,10 +409,10 @@ Goal: integrate the runtime with a bounded model decision loop while keeping dur
 
 ### Green
 
-- [ ] Implement `RobotAgentHarness` as the root owner of model adapter, journal, snapshot provider, contracts, leases, executor, runner, projections, and recovery.
+- [ ] Implement `RobotAgentHarness` as the root owner of model adapter, standard tool dispatcher, journal, snapshot provider, physical action contracts, leases, executor, runner, projections, and recovery.
 - [ ] Implement `RobotAgentHarnessModule` as the sole coordinator-visible lifecycle owner of one `RobotAgentHarness` and the `ActionRuntimeSpec` RPC implementation.
 - [ ] Reuse LangGraph or the existing model abstraction only as the bounded decision loop; do not use chat history as mission state.
-- [ ] Generate model tools from native skill discovery and wrap physical tools with `ActionRunner`.
+- [ ] Generate standard model tools from native skill discovery without changing their schemas; wrap only tools with a `PhysicalActionContract` using `ActionRunner`.
 - [ ] Expose the same contracted physical action entrypoint to `McpServer` through `ActionRuntimeSpec`; do not maintain a separate MCP action runner.
 - [ ] Record projection digest, model response, and tool calls after redaction.
 - [ ] Implement bounded context construction from projections and artifact references.
@@ -431,7 +434,7 @@ Goal: demonstrate a real DIMOS physical skill whose resource lifetime matches co
 ### Red
 
 - [ ] Reproduce the existing issue where `navigate_with_text` releases movement after `set_goal()` returns.
-- [ ] Test the migrated contract declares physical kind, exclusive base movement, freshness bounds, timeout, stop handler, verifier, and `NEVER_IF_UNKNOWN` replay.
+- [ ] Test the migrated `PhysicalActionContract` declares exclusive base movement, freshness bounds, timeout, stop handler, verifier, and `NEVER_IF_UNKNOWN` replay.
 - [ ] Test tagged-location and semantic-map navigation return a correlated background action rather than claiming completion.
 - [ ] Test goal-reached produces a correlated completion report.
 - [ ] Test navigation success is verified from a fresh pose and zero-motion or idle-controller evidence.
@@ -444,7 +447,7 @@ Goal: demonstrate a real DIMOS physical skill whose resource lifetime matches co
 - [ ] Add action ID propagation from the runner context into `NavigationSkillContainer`.
 - [ ] Refactor `navigate_with_text` so starting a goal has a background lifecycle for every asynchronous path.
 - [ ] Emit typed navigation started, progress where meaningful, completion, failure, and stopped events.
-- [ ] Preserve the existing user-visible skill name and legacy MCP behavior.
+- [ ] Preserve the existing user-visible tool name, schema, call ID, and MCP result behavior.
 - [ ] Add a trusted navigation verifier that checks controller state and target tolerance using a fresh snapshot.
 - [ ] Route migrated movement ownership through `LeaseManager` and disable duplicate `CapabilityRegistry` acquisition for both native and MCP contracted action paths.
 - [ ] Keep path planning, obstacle avoidance, and velocity control inside existing navigation modules.
@@ -460,6 +463,7 @@ Goal: demonstrate a real DIMOS physical skill whose resource lifetime matches co
 Goal: prove the complete model-to-action-to-projection flow without LFS, hardware, or a live model.
 
 - [ ] Add `dimos/agents/runtime/fixtures/test_scripted_navigation_mission.json` containing recorded `MockModel` responses.
+- [ ] Add an ordinary uncontracted query tool and assert it preserves its standard call/result correlation, creates no `ActionIntent`, and acquires no physical lease.
 - [ ] Add a scripted physical skill module that emits typed progress and changes a fake world state using event synchronization.
 - [ ] Compose the scripted module, snapshot module, `RobotAgentHarnessModule`, and recorded model through a real `ModuleCoordinator`.
 - [ ] Send one mission input: navigate to the scripted target.

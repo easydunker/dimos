@@ -12,7 +12,7 @@ The companion [implementation plan](/docs/capabilities/agents/robot_action_runti
 
 ## Decision
 
-Add a deterministic Robot Action Runtime between model-generated tool calls and physical DIMOS skills. The model proposes an `ActionIntent`; the runtime grounds it in a fresh world snapshot, prepares and admits it under trusted policy, owns its resources while it executes, monitors typed events, verifies the physical outcome, and writes every transition to an append-only mission journal.
+Add a deterministic Robot Action Runtime behind the standard tool-dispatch boundary for physical DIMOS skills. The model continues to emit ordinary tool calls. When trusted skill metadata includes a `PhysicalActionContract`, the dispatcher derives an `ActionIntent` from that tool call and submits it to the runtime. The runtime grounds the proposed physical action in a fresh world snapshot, prepares and admits it under trusted policy, owns its resources while it executes, monitors typed events, verifies the physical outcome, and writes every transition to an append-only mission journal.
 
 DIMOS Modules, Blueprints, typed streams, RPC, controllers, simulation, replay, and skills remain the robotics data plane. MCP remains an external compatibility boundary. The runtime is the agent control plane and uses native skill dispatch for the built-in harness.
 
@@ -42,7 +42,7 @@ The runtime makes those conditions explicit instead of encoding them in prompts 
 ## Goals
 
 - Ground each model decision in an immutable, versioned view of relevant robot and environment state.
-- Convert model tool calls into trusted, fully specified prepared actions without side effects.
+- Convert contracted physical tool calls into trusted, fully specified prepared actions without changing the standard agent tool protocol.
 - Admit physical actions using freshness, precondition, resource, safety, and approval checks.
 - Retain resource ownership for the complete physical lifetime of an action.
 - Monitor action progress without sending high-frequency sensor traffic to the model.
@@ -60,7 +60,8 @@ The runtime makes those conditions explicit instead of encoding them in prompts 
 - Building a general behavior-tree engine, fleet scheduler, or VLA runtime in the prototype.
 - Making MCP the internal execution path for the new built-in harness.
 - Proving cryptographic non-repudiation. The prototype journal is append-only and tamper-evident, not a signed audit service.
-- Requiring all existing skills to migrate at once. Uncontracted skills remain callable through the legacy path until explicitly classified.
+- Replacing standard tool-call schemas, call IDs, dispatch, or result messages with an action-specific agent protocol.
+- Requiring all existing skills to migrate at once. Existing uncontracted skills remain ordinary tools on their current path until explicitly migrated; they do not receive the runtime's physical-action guarantees.
 
 ## Safety and execution invariants
 
@@ -70,7 +71,7 @@ The implementation must preserve these invariants:
 2. A physical action is never dispatched before its dispatch intent is durably appended.
 3. A model-provided value cannot lower a developer-authored risk, resource, freshness, timeout, stop, verification, or replay requirement.
 4. An action references both the snapshot used for the model decision and the fresh snapshot used for final admission.
-5. Only fields declared as relevant by the skill contract invalidate an action when the world changes.
+5. Only fields declared as relevant by the physical action contract invalidate an action when the world changes.
 6. A physical resource lease remains owned until termination is physically verified. An `UNKNOWN` outcome transfers affected resources to a quarantined safety state; it does not make them available to another action.
 7. An RPC return cannot by itself settle a physical action as `SUCCEEDED` unless the contract explicitly defines the RPC result as sufficient evidence.
 8. Cancelling a model turn does not imply that an active action was cancelled.
@@ -93,8 +94,8 @@ process.
 |---|---|---|
 | `RobotAgentHarness` | Own mission lifecycle, model turns, projections, and runtime component lifecycle | Issue motor commands directly |
 | `WorldSnapshotProvider` | Obtain a detached observation draft from robot-specific adapters, merge runtime projections, and persist an immutable logical cut | Interpret mission goals |
-| `SkillContractRegistry` | Resolve trusted execution metadata for discovered skills | Accept policy metadata from the model |
-| `ActionPreparer` | Combine an intent, contract, and decision snapshot into a `PreparedAction` | Invoke a skill |
+| `PhysicalActionContractRegistry` | Resolve optional trusted physical-execution metadata for discovered tools | Accept policy metadata from the model or require every ordinary tool to adopt action semantics |
+| `ActionPreparer` | Combine a schema-validated physical tool-call intent, contract, and decision snapshot into a `PreparedAction` | Invoke a skill or redefine the standard tool schema |
 | `AdmissionPipeline` | Validate freshness, preconditions, safety, approval, and resource availability | Mutate the prepared action to weaken policy |
 | `LeaseManager` | Atomically own resources by action, enforce expiry, and support emergency revocation | Infer physical completion from lease release |
 | `SkillExecutor` | Dispatch through native `SkillsProxy` and return a correlated execution handle | Decide whether an action is safe or successful |
@@ -108,26 +109,23 @@ The prototype may run several of these as plain Python components in the harness
 worker. Interfaces remain separate so safety, storage, and execution can later move
 across process boundaries.
 
-## Skill classification and contracts
+## Standard tools and physical action contracts
 
-Every migrated skill has a trusted `SkillContract`. The model sees only the skill name, description, and argument schema; it does not author the contract.
+The standard agent tool concept remains the public protocol. Tool names, descriptions, JSON argument schemas, tool-call IDs, dispatcher behavior, and tool-result messages remain compatible with the existing model loop and MCP clients. The runtime does not introduce an action-specific tool format.
 
-### Skill kinds
+A physical DIMOS skill opts into managed execution by attaching a trusted `PhysicalActionContract` to its existing `@skill` metadata. The model sees the ordinary tool definition; it does not author or override the contract. The dispatcher resolves the contract after receiving a standard tool call:
 
-| Kind | Meaning | Execution treatment |
-|---|---|---|
-| `QUERY` | Reads state without changing the physical world, such as battery or observation | Validate and journal the call; no physical transaction required |
-| `COMPUTE` | Produces a plan or inference without commanding hardware | Apply timeout and artifact handling; no physical lease unless declared |
-| `PHYSICAL` | Commands or maintains a physical effect | Full preparation, admission, leasing, monitoring, cancellation, and verification |
+- A tool without a `PhysicalActionContract` follows the existing ordinary tool path and does not create an `ActionIntent`.
+- A tool with a valid `PhysicalActionContract` preserves its standard tool-call identity, derives an `ActionIntent`, and enters the full preparation, admission, leasing, monitoring, cancellation, and verification path.
+- A tool declared for managed physical execution with an invalid or incomplete contract fails registration or preparation before dispatch.
 
-### Required contract fields
+Existing uncontracted physical skills may remain callable on their current ordinary tool path during migration for backward compatibility, but the runtime must not represent them as admitted or verified actions. New physical skills and migrated physical entrypoints must provide a valid contract.
+
+### Required physical action contract fields
 
 | Field | Meaning |
 |---|---|
-| `name` and `contract_version` | Stable skill identity and metadata version |
-| `kind` | `QUERY`, `COMPUTE`, or `PHYSICAL` |
-| `argument_schema` | Existing generated JSON schema |
-| `execution_mode` | Synchronous return or background handle |
+| `contract_id` and `contract_version` | Stable physical-policy identity and metadata version |
 | `resources` | Resource requests and modes |
 | `risk_class` | Deterministic policy input; initially `LOW`, `MEDIUM`, or `HIGH` |
 | `required_observations` | Snapshot fields and maximum allowed ages |
@@ -137,12 +135,14 @@ Every migrated skill has a trusted `SkillContract`. The model sees only the skil
 | `stop_timeout_s` | Deadline for proving the stop condition |
 | `completion_source` | Synchronous result, typed action event, controller state, or verifier |
 | `verifier` | Named deterministic physical-effect verifier |
-| `replay_policy` | `SAFE_QUERY`, `IDEMPOTENT`, `COMPENSATABLE`, or `NEVER_IF_UNKNOWN` |
+| `replay_policy` | `IDEMPOTENT`, `COMPENSATABLE`, or `NEVER_IF_UNKNOWN` |
 | `approval_policy` | Whether deterministic human approval is required |
 
-Contract names resolve to registered predicates and verifiers in trusted code. They are data, not arbitrary executable source loaded from a journal or model response.
+Contract IDs resolve to registered predicates and verifiers in trusted code. Contracts are data, not arbitrary executable source loaded from a journal or model response.
 
-The prototype extends the existing `@skill` metadata and `SkillInfo` without breaking bare `@skill` usage. A skill without a physical contract is treated as legacy and cannot enter the physical `ActionRunner` path until it is classified.
+The contract does not duplicate the standard tool's name, description, argument schema, call ID, result envelope, or lifecycle. Existing `SkillInfo` metadata remains authoritative for those fields. Preparation first applies the ordinary tool schema, then combines the validated call with the physical action contract.
+
+The prototype extends the existing `@skill` metadata and `SkillInfo` with one optional physical action contract without breaking bare `@skill` usage. Contract presence selects the action-runtime route; absence preserves ordinary tool execution.
 
 ### Prototype resource model
 
@@ -156,15 +156,15 @@ All durable records include a schema version. Identifiers are opaque strings gen
 
 ### `ActionIntent`
 
-An `ActionIntent` is the untrusted proposal derived from one model tool call.
+An `ActionIntent` is the untrusted physical-action proposal derived from one standard tool call whose registered skill has a `PhysicalActionContract`. Ordinary tool calls do not create this record.
 
 | Field | Source |
 |---|---|
 | `intent_id` | Harness |
 | `mission_id` and `turn_id` | Harness |
-| `skill_name` and `arguments` | Model tool call |
+| `tool_name` and `arguments` | Standard model tool call |
 | `decision_snapshot_version` | Harness context used for the model turn |
-| `model_call_id` | Model adapter |
+| `tool_call_id` | Standard tool-call ID preserved unchanged from the model adapter |
 | `requested_at` | Harness clock |
 
 ### `PreparedAction`
@@ -175,7 +175,7 @@ A `PreparedAction` is immutable and side-effect free. It contains validated argu
 |---|---|
 | `action_id` | Stable identity for all later events |
 | `intent` | Original proposal and provenance |
-| `contract_name` and `contract_version` | Exact trusted contract used |
+| `physical_action_contract_id` and `contract_version` | Exact trusted physical action contract used |
 | `validated_arguments` | Canonical arguments after schema validation |
 | `decision_snapshot_version` | Snapshot that grounded the model decision |
 | `required_observations` | Relevant fields and freshness bounds |
@@ -239,7 +239,7 @@ The executor adapts existing `ToolStream` notifications during migration. Correl
 
 ### `ActionOutcome`
 
-An outcome contains the terminal state, structured error code, decision and admission snapshot versions, final verification snapshot version, observed effects, timing, and a recommended next disposition: continue, retry deterministically, replan, request human help, or stop the mission.
+An outcome contains the terminal state, structured error code, decision and admission snapshot versions, final verification snapshot version, observed effects, timing, and a recommended next disposition: continue, retry deterministically, replan, request human help, or stop the mission. The harness projects that outcome into a standard tool-result message associated with the original `tool_call_id`; the model loop does not consume a new action-specific response protocol.
 
 ## World snapshots
 
@@ -275,7 +275,7 @@ Snapshots are persisted at decision boundaries, final admission, safety interven
 
 The model turn receives a decision snapshot version. Immediately before dispatch, the `ActionRunner` captures a new admission snapshot after any approval or resource wait.
 
-The runtime compares only the fields declared by the skill contract. A newer unrelated camera frame does not invalidate an action that depends only on localization and battery. A changed or stale localization field does.
+The runtime compares only the fields declared by the physical action contract. A newer unrelated camera frame does not invalidate an action that depends only on localization and battery. A changed or stale localization field does.
 
 An invalidated action returns to preparation or asks the model to decide again; it is never silently executed against different arguments or weakened preconditions.
 
@@ -354,7 +354,7 @@ The chat transcript is not the runtime database. `ProjectionBuilder` determinist
 - Active actions, state, elapsed time, and owned resources.
 - Recent salient progress, failure, safety, and intervention events.
 - Unresolved or unknown actions.
-- Available contracted skills appropriate to the current state.
+- Available standard tools appropriate to the current state.
 - Artifact references selected for the next model request.
 - The exact decision question the model must answer.
 
@@ -372,8 +372,10 @@ Other projections include current mission state, active action and lease state, 
 2. The harness captures and persists a decision snapshot.
 3. The projection builder creates bounded model context from the snapshot and journal.
 4. The model returns text and zero or more tool calls.
-5. Each tool call is journaled as an `ActionIntent`.
-6. The preparer resolves the trusted contract, validates and canonicalizes arguments, and emits a `PreparedAction` without side effects.
+5. The harness journals the model response and standard tool calls while preserving each tool-call ID.
+6. The normal tool dispatcher resolves each tool using existing discovery. Uncontracted tools continue through the ordinary execution path.
+7. For a tool with a `PhysicalActionContract`, the dispatcher derives and journals an `ActionIntent` tied to the original tool-call ID.
+8. The preparer resolves the trusted contract, validates and canonicalizes arguments, and emits a `PreparedAction` without side effects.
 
 ### Admission and dispatch
 
@@ -388,7 +390,7 @@ Other projections include current mission state, active action and lease state, 
 
 Any failed gate releases provisional resources, journals a structured rejection, and returns a structured outcome. Later gates may make a decision stricter but never weaken an earlier policy requirement.
 
-The harness may prepare independent tool calls concurrently. Query and compute calls may execute concurrently when their contracts permit it. Physical calls may execute concurrently only after the lease manager proves that their resources are disjoint and the safety supervisor admits the combination. The journal's global sequence provides a deterministic ordering for projection even when execution overlaps.
+The harness may execute independent ordinary tool calls according to the existing dispatcher semantics and may prepare independent contracted physical tool calls concurrently. Contracted physical calls may execute concurrently only after the lease manager proves that their resources are disjoint and the safety supervisor admits the combination. The journal's global sequence provides a deterministic ordering for projection even when execution overlaps.
 
 ### Monitoring and verification
 
@@ -419,16 +421,16 @@ At startup, the runtime validates the journal, rebuilds projections, and finds e
 6. Releases leases only after a reconciled, physically verified non-active condition. An unknown condition keeps the affected resources quarantined.
 7. Asks the model to replan only after deterministic reconciliation finishes.
 
-Replay follows the contract's policy. `SAFE_QUERY` may run again, `IDEMPOTENT` requires the same idempotency key, `COMPENSATABLE` requires an explicit recovery path, and `NEVER_IF_UNKNOWN` is never automatically replayed.
+Replay of a contracted physical action follows the contract's policy. `IDEMPOTENT` requires the same idempotency key, `COMPENSATABLE` requires an explicit recovery path, and `NEVER_IF_UNKNOWN` is never automatically replayed. Replay of ordinary tools remains outside the physical action runtime and follows the existing tool harness policy.
 
 ## Integration with existing DIMOS primitives
 
 - Preserve `Module`, `Blueprint`, typed stream, transport, controller, and robot-specific skill implementations.
-- Extend `@skill` and the core `SkillInfo` with optional contract metadata while retaining existing call sites.
+- Extend `@skill` and the core `SkillInfo` with an optional `PhysicalActionContract` while retaining existing tool schemas, call IDs, result messages, and call sites.
 - Use `Dimos.connect()` and `SkillsProxy` from [`dimos/porcelain/dimos.py`](/dimos/porcelain/dimos.py#L107) and [`skills_proxy.py`](/dimos/porcelain/skills_proxy.py#L47) for built-in native dispatch.
-- Keep `McpServer` for external agents. Its tool metadata should expose non-sensitive contract fields for discovery. Contracted physical calls from MCP and the native model loop must enter the `ActionRuntimeSpec` hosted by the same coordinator-visible `RobotAgentHarnessModule`; MCP must not directly dispatch them or become a second authority for safety or resource ownership. Uncontracted legacy calls retain their current path during migration.
+- Keep `McpServer` for external agents. Its `tools/list` definitions remain standard and do not expose or duplicate the physical action contract. On invocation, server-side trusted discovery determines whether the call enters the `ActionRuntimeSpec` hosted by the same coordinator-visible `RobotAgentHarnessModule`. MCP must not directly dispatch contracted physical calls or become a second authority for safety or resource ownership. Uncontracted calls retain their ordinary path during migration.
 - Adapt legacy `ToolStream` messages into typed action progress during migration. New physical skills should emit correlated `ActionEvent`s directly.
-- Remove `CapabilityRegistry` from the dispatch path for contracted physical actions. It remains only for uncontracted legacy calls; `ActionRuntimeSpec` routes both native and MCP contracted calls through the same `LeaseManager`.
+- Remove `CapabilityRegistry` from the dispatch path for contracted physical actions. It remains available to ordinary calls that already use it; `ActionRuntimeSpec` routes both native and MCP contracted calls through the same `LeaseManager`.
 - Reuse `SkillResult` from [`skill_result.py`](/dimos/agents/skill_result.py#L55) for structured synchronous results, but do not equate `success=True` with verified physical success unless the contract permits it.
 - Reuse replay and `MockModel` fixtures for deterministic integration and end-to-end tests.
 
@@ -436,7 +438,7 @@ Replay follows the contract's policy. `SAFE_QUERY` may run again, `IDEMPOTENT` r
 
 | Failure | Required behavior |
 |---|---|
-| Missing or invalid contract | Reject before dispatch and journal the preparation failure |
+| Tool declared for managed physical execution has a missing or invalid contract | Reject before dispatch and journal the registration or preparation failure; an ordinary uncontracted tool is not an error |
 | Required observation missing or stale | Capture again if bounded; otherwise reject without invoking the skill |
 | Resource conflict | Wait within policy or reject; never run conflicting actions concurrently |
 | Safety rejection | Journal the policy reason and do not invoke the skill |
@@ -481,6 +483,7 @@ Operational logs remain useful for process debugging, but they do not replace do
 
 The prototype is complete when all of the following are demonstrated without hardware or a live model:
 
+- An ordinary uncontracted tool preserves the standard tool-call ID and result message and does not create an `ActionIntent`.
 - A recorded model fixture proposes a contracted physical action.
 - The harness captures a decision snapshot and a fresher admission snapshot.
 - A stale required observation prevents skill invocation.
