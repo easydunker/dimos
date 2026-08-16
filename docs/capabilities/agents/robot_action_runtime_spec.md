@@ -81,7 +81,13 @@ The implementation must preserve these invariants:
 
 ## Runtime boundary
 
-The runtime consists of one lifecycle-owning root and several injected components. The root starts and stops its stores, subscriptions, and executors; no component relies on a global mutable registry.
+The runtime consists of one lifecycle-owning root and several injected components. A
+`RobotAgentHarnessModule` hosts that root in the coordinator so both native callers and
+`McpServer` resolve the same `ActionRuntimeSpec` RPC service. The harness itself remains
+a plain, directly testable Python object. The host module starts and stops its stores,
+subscriptions, and executors; no component relies on a global mutable registry. A CLI
+client may attach to the host module, but must not construct a second runtime in its own
+process.
 
 | Component | Responsibility | Must not do |
 |---|---|---|
@@ -98,7 +104,9 @@ The runtime consists of one lifecycle-owning root and several injected component
 | `ProjectionBuilder` | Derive current mission, active action, operator, recovery, and LLM views | Become a second source of truth |
 | `ArtifactStore` | Store content-addressed images, maps, point clouds, and large model artifacts | Own mission or action state |
 
-The prototype may run several of these as plain Python components in one harness process. Interfaces remain separate so safety, storage, and execution can later move across process boundaries.
+The prototype may run several of these as plain Python components in the harness-module
+worker. Interfaces remain separate so safety, storage, and execution can later move
+across process boundaries.
 
 ## Skill classification and contracts
 
@@ -140,7 +148,7 @@ The prototype extends the existing `@skill` metadata and `SkillInfo` without bre
 
 The first implementation supports exclusive resources with an action owner, priority, lease deadline, and heartbeat. This directly replaces the current ambiguous lifetime of the `movement` capability for migrated skills.
 
-The data model must leave room for shared resources, capacity resources, and spatial zones, but those modes are follow-up work. Emergency stop may revoke any lease; normal model actions cannot preempt each other in the prototype.
+The data model must leave room for shared resources, capacity resources, and spatial zones, but those modes are follow-up work. Emergency stop may revoke an action's dispatch authority regardless of priority, but revocation or heartbeat expiry quarantines a physical resource rather than making it available. Only verified safe termination releases it. Normal model actions cannot preempt each other in the prototype.
 
 ## Domain records
 
@@ -183,9 +191,34 @@ Allowed states are `PROPOSED`, `PREPARED`, `ADMITTED`, `DISPATCHING`, `EXECUTING
 
 The normal path is `PROPOSED` to `PREPARED` to `ADMITTED` to `DISPATCHING` to `EXECUTING` to `VERIFYING` to `SUCCEEDED` or `FAILED`.
 
-`REJECTED` is terminal and means no physical dispatch occurred. `CANCELLED` is terminal only after the stop condition is verified. `UNKNOWN` is terminal for the action's automation but requires operator visibility or reconciliation because the physical effect could not be proven. Resources affected by an unknown physical effect remain quarantined.
+`REJECTED` is terminal and means admission or preparation refused the proposal. A
+pre-dispatch `CANCELLED` action needs proof that the executor was never invoked; after
+possible dispatch, `CANCELLED` is terminal only after the stop condition is verified.
+`UNKNOWN` is terminal for the action's automation but requires operator visibility or
+reconciliation because the physical effect could not be proven. Resources affected by
+an unknown physical effect remain quarantined.
 
 Invalid transitions fail closed, append an internal-error event, and do not invoke or replay a skill.
+
+The authoritative prototype transition graph is:
+
+- `PROPOSED -> PREPARED | REJECTED`
+- `PREPARED -> ADMITTED | REJECTED | CANCELLED`
+- `ADMITTED -> DISPATCHING | CANCELLED`
+- `DISPATCHING -> EXECUTING | FAILED | CANCELLED | STOPPING | UNKNOWN`
+- `EXECUTING -> VERIFYING | FAILED | STOPPING | UNKNOWN`
+- `VERIFYING -> SUCCEEDED | FAILED | STOPPING | UNKNOWN`
+- `STOPPING -> CANCELLED | UNKNOWN`
+
+The five terminal states are `SUCCEEDED`, `FAILED`, `CANCELLED`, `REJECTED`, and
+`UNKNOWN`. Preparation and admission failures use `REJECTED`, because no physical call
+was made. `FAILED` is reserved for an action whose lack of effect or safe termination is
+known after dispatch was attempted. Cancellation may settle directly as `CANCELLED`
+only while the runtime can prove the executor was not invoked; after invocation or
+ambiguous delivery it must pass through `STOPPING`. Recovery does not mutate a terminal
+`UNKNOWN` action into another state: later evidence is appended as a
+reconciliation event, and a quarantined resource is cleared only by an explicit,
+verified safety-reconciliation event.
 
 ### `ActionEvent`
 
@@ -260,7 +293,9 @@ The journal is not a substitute for physical truth. On restart, the runtime rest
 
 Every journal event contains a global sequence, event ID, schema version, event type, mission ID, optional turn and action IDs, occurrence and recording timestamps, optional world version, causation and correlation IDs, canonical JSON payload, previous-event hash, and event hash.
 
-The hash chain makes accidental or offline mutation detectable. It is not a security boundary because the prototype does not protect the signing key or database from an administrator.
+The hash chain makes accidental or offline mutation detectable. It is not a security
+boundary: the prototype has no signing key, and an administrator who can rewrite the
+database can recompute the unkeyed hashes.
 
 ### Required event families
 
@@ -274,7 +309,7 @@ The hash chain makes accidental or offline mutation detectable. It is not a secu
 | Resources | `LEASE_ACQUIRED`, `LEASE_RENEWED`, `LEASE_RELEASED`, `LEASE_REVOKED` |
 | Dispatch | `ACTION_DISPATCH_REQUESTED`, `ACTION_DISPATCH_ACCEPTED`, `ACTION_DISPATCH_FAILED` |
 | Execution | `ACTION_STARTED`, `ACTION_PROGRESS`, `ACTION_COMPLETION_REPORTED`, `ACTION_EXECUTION_FAILED` |
-| Stop | `ACTION_CANCEL_REQUESTED`, `STOP_COMMAND_SENT`, `STOP_VERIFIED`, `STOP_VERIFICATION_FAILED` |
+| Stop | `ACTION_CANCEL_REQUESTED`, `STOP_COMMAND_SENT`, `STOP_COMMAND_ACCEPTED`, `STOP_COMMAND_FAILED`, `STOP_COMMAND_UNKNOWN`, `STOP_VERIFIED`, `STOP_VERIFICATION_FAILED` |
 | Verification | `ACTION_VERIFICATION_STARTED`, `ACTION_VERIFIED`, `ACTION_VERIFICATION_FAILED` |
 | Settlement | `ACTION_SUCCEEDED`, `ACTION_FAILED`, `ACTION_CANCELLED`, `ACTION_UNKNOWN` |
 | Recovery | `RECOVERY_STARTED`, `ACTION_RECONCILED`, `RECOVERY_FINISHED` |
@@ -363,7 +398,12 @@ On reported completion, the runner captures a fresh snapshot and evaluates the n
 
 ### Cancellation
 
-Cancellation revokes the action's authority, appends `ACTION_CANCEL_REQUESTED`, invokes the trusted stop handler, and monitors the stop condition until its deadline. Only observed safe state produces `ACTION_CANCELLED` and lease release.
+Cancellation revokes the action's authority and durably appends
+`ACTION_CANCEL_REQUESTED` followed by `STOP_COMMAND_SENT` before invoking the trusted
+stop handler. It then records the call settlement and monitors the stop condition until
+its deadline. The stop command is itself an external physical effect and follows the
+same intent-before-effect rule as initial dispatch. Only observed safe state produces
+`STOP_VERIFIED`, `ACTION_CANCELLED`, and lease release.
 
 If stopping cannot be proven, the runner appends `ACTION_UNKNOWN`, quarantines the affected resources, retains an explicit unsafe or unknown runtime state, invokes the independent safety escalation path, and exposes the condition to the operator.
 
@@ -386,7 +426,7 @@ Replay follows the contract's policy. `SAFE_QUERY` may run again, `IDEMPOTENT` r
 - Preserve `Module`, `Blueprint`, typed stream, transport, controller, and robot-specific skill implementations.
 - Extend `@skill` and the core `SkillInfo` with optional contract metadata while retaining existing call sites.
 - Use `Dimos.connect()` and `SkillsProxy` from [`dimos/porcelain/dimos.py`](/dimos/porcelain/dimos.py#L107) and [`skills_proxy.py`](/dimos/porcelain/skills_proxy.py#L47) for built-in native dispatch.
-- Keep `McpServer` for external agents. Its tool metadata should expose non-sensitive contract fields for discovery. Contracted physical calls from MCP and the native model loop must enter the same `ActionRunner`; MCP must not directly dispatch them or become a second authority for safety or resource ownership. Uncontracted legacy calls retain their current path during migration.
+- Keep `McpServer` for external agents. Its tool metadata should expose non-sensitive contract fields for discovery. Contracted physical calls from MCP and the native model loop must enter the `ActionRuntimeSpec` hosted by the same coordinator-visible `RobotAgentHarnessModule`; MCP must not directly dispatch them or become a second authority for safety or resource ownership. Uncontracted legacy calls retain their current path during migration.
 - Adapt legacy `ToolStream` messages into typed action progress during migration. New physical skills should emit correlated `ActionEvent`s directly.
 - Remove `CapabilityRegistry` from the dispatch path for contracted physical actions. It remains only for uncontracted legacy calls; `ActionRuntimeSpec` routes both native and MCP contracted calls through the same `LeaseManager`.
 - Reuse `SkillResult` from [`skill_result.py`](/dimos/agents/skill_result.py#L55) for structured synchronous results, but do not equate `success=True` with verified physical success unless the contract permits it.
@@ -401,7 +441,8 @@ Replay follows the contract's policy. `SAFE_QUERY` may run again, `IDEMPOTENT` r
 | Resource conflict | Wait within policy or reject; never run conflicting actions concurrently |
 | Safety rejection | Journal the policy reason and do not invoke the skill |
 | Approval delay | Revalidate the world after approval before dispatch |
-| Skill RPC exception before acceptance | Journal dispatch failure and release leases after verifying no effect began |
+| Executor proves the RPC was never invoked | Journal dispatch failure and release leases |
+| RPC exception after invocation or with ambiguous delivery | Settle `UNKNOWN`, reconcile, and never release or retry merely because an exception was raised |
 | Lost response after possible dispatch | Settle `UNKNOWN`, reconcile, and never blind-retry |
 | Progress stream disconnect | Query controller state, then continue, stop, or settle unknown |
 | Execution timeout | Begin cancellation; timeout alone does not release physical resources |

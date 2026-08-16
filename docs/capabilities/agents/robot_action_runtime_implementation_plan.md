@@ -73,6 +73,7 @@ The target layout is listed here so implementers do not invent competing locatio
 | `dimos/agents/runtime/action_runtime_spec.py` | RPC protocol used by native and MCP callers |
 | `dimos/agents/runtime/projections.py` | Deterministic journal projections |
 | `dimos/agents/runtime/harness.py` | Lifecycle-owning root and model-turn integration |
+| `dimos/agents/runtime/harness_module.py` | Coordinator module that owns one harness and exposes `ActionRuntimeSpec` |
 | `dimos/agents/runtime/testing.py` | Reusable deterministic fakes for runtime tests |
 | `dimos/agents/runtime/fixtures/` | Small recorded model responses only |
 | `dimos/cli/agent_harness.py` | Experimental native harness CLI |
@@ -251,6 +252,7 @@ Goal: guarantee one owner for physical resources and make all pre-dispatch gates
 - [ ] Test renew and release require the owning action ID and lease token.
 - [ ] Test an expired lease becomes unsafe and invokes the configured deadman callback; it is not silently reused.
 - [ ] Test emergency revocation works regardless of normal priority.
+- [ ] Test expiry and emergency revocation remove dispatch authority but quarantine physical resources until verified safe; neither operation makes a resource reusable.
 - [ ] Test model actions cannot preempt another normal action in the prototype.
 - [ ] Test admission rejects missing and stale required observations without invoking the executor.
 - [ ] Test unrelated snapshot changes do not reject the action.
@@ -262,7 +264,7 @@ Goal: guarantee one owner for physical resources and make all pre-dispatch gates
 ### Green
 
 - [ ] Implement a harness-owned `LeaseManager` using a lock and injected monotonic clock.
-- [ ] Represent ownership with action ID, opaque token, deadline, heartbeat time, priority, and status.
+- [ ] Represent ownership with action ID, opaque token, deadline, heartbeat time, priority, and status; distinguish active, revoked, and quarantined from available.
 - [ ] Implement acquire, renew, release, snapshot, conflict, and emergency-revoke operations.
 - [ ] Implement ordered admission gates: schema, initial snapshot, preconditions, safety, approval, lease acquisition, final snapshot revalidation, final safety.
 - [ ] Return immutable `AdmissionDecision` values with stable reason codes.
@@ -324,12 +326,16 @@ Goal: implement the complete prepared-action transaction and failure semantics.
 - [ ] Assert completion events with the wrong action ID are ignored and journaled as diagnostics.
 - [ ] Assert a failed verifier produces failure or recovery according to contract.
 - [ ] Assert timeout starts cancellation and does not directly release resources.
+- [ ] Assert cancellation before executor invocation settles directly and releases provisional leases; cancellation after possible invocation enters `STOPPING`.
 - [ ] Assert successful cancellation requires stop verification before `ACTION_CANCELLED` and lease release.
 - [ ] Assert failed stop verification produces `ACTION_UNKNOWN`, safety escalation, and a quarantined resource that rejects new normal actions.
 - [ ] Assert a lost dispatch response produces `ACTION_UNKNOWN` and no automatic retry.
 - [ ] Assert two admitted actions with disjoint resources may execute concurrently while conflicting actions cannot.
 - [ ] Assert all exit paths release nonphysical resources and close subscriptions.
 - [ ] Assert user cancellation and safety cancellation are distinguishable in the journal.
+- [ ] Assert `STOP_COMMAND_SENT` commits before the stop handler is invoked, including the journal-failure path.
+- [ ] Assert every invoked stop command records accepted, failed-before-invocation, or unknown-delivery settlement before stop verification.
+- [ ] Assert only a proven pre-invocation failure settles `FAILED`; any ambiguous RPC delivery settles `UNKNOWN` and keeps resources quarantined.
 
 ### Green
 
@@ -401,15 +407,16 @@ Goal: integrate the runtime with a bounded model decision loop while keeping dur
 ### Green
 
 - [ ] Implement `RobotAgentHarness` as the root owner of model adapter, journal, snapshot provider, contracts, leases, executor, runner, projections, and recovery.
+- [ ] Implement `RobotAgentHarnessModule` as the sole coordinator-visible lifecycle owner of one `RobotAgentHarness` and the `ActionRuntimeSpec` RPC implementation.
 - [ ] Reuse LangGraph or the existing model abstraction only as the bounded decision loop; do not use chat history as mission state.
 - [ ] Generate model tools from native skill discovery and wrap physical tools with `ActionRunner`.
 - [ ] Expose the same contracted physical action entrypoint to `McpServer` through `ActionRuntimeSpec`; do not maintain a separate MCP action runner.
 - [ ] Record projection digest, model response, and tool calls after redaction.
 - [ ] Implement bounded context construction from projections and artifact references.
 - [ ] Add explicit start and stop lifecycle and no import-time work.
-- [ ] Add the experimental `dimos agent-harness` CLI that connects to an already running DIMOS coordinator.
+- [ ] Add the experimental `dimos agent-harness` CLI that connects to the `RobotAgentHarnessModule` in an already running DIMOS coordinator; fail clearly if the running blueprint does not contain the host module, and never create a second local runtime.
 - [ ] Register the command in `dimos/cli/dimos.py` and cover command discovery in the existing CLI startup tests.
-- [ ] Support `--model-fixture`, `--journal-path`, and noninteractive one-message execution for tests.
+- [ ] Put model-fixture and journal-path configuration on the host module or blueprint. Support noninteractive one-message execution in the CLI without letting a CLI client replace those runtime-owned settings after startup.
 
 ### Refactor and acceptance
 
@@ -454,9 +461,9 @@ Goal: prove the complete model-to-action-to-projection flow without LFS, hardwar
 
 - [ ] Add `dimos/agents/runtime/fixtures/test_scripted_navigation_mission.json` containing recorded `MockModel` responses.
 - [ ] Add a scripted physical skill module that emits typed progress and changes a fake world state using event synchronization.
-- [ ] Compose the scripted module, snapshot module, native harness, and recorded model through a real `ModuleCoordinator`.
+- [ ] Compose the scripted module, snapshot module, `RobotAgentHarnessModule`, and recorded model through a real `ModuleCoordinator`.
 - [ ] Send one mission input: navigate to the scripted target.
-- [ ] Assert exact journal ordering: decision snapshot, tool proposal, preparation, admission snapshot, lease, dispatch intent, acceptance, progress, completion report, verification snapshot, success, release.
+- [ ] Assert exact journal ordering: decision snapshot, tool proposal, preparation, provisional lease, admission snapshot, admission grant, dispatch intent, acceptance, progress, completion report, verification snapshot, success, release.
 - [ ] Assert the final LLM projection reports success and contains no raw high-rate state.
 - [ ] Assert no MCP HTTP server is required.
 - [ ] Assert fixture teardown stops the coordinator, transports, worker pool, executor, journal, and artifact store even on failure.
