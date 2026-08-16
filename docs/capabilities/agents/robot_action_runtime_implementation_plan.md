@@ -1,589 +1,391 @@
 ---
-title: "Robot Action Runtime Prototype Implementation Plan"
+title: "Closed-Loop Robot Agent Harness Implementation Plan"
 ---
 
-# Robot Action Runtime Prototype Implementation Plan
+# Closed-Loop Robot Agent Harness Implementation Plan
 
-Status: not started.
+Status: proposed prototype plan.
 
-This document is both the implementation handoff and the progress tracker for the [Robot Action Runtime specification](/docs/capabilities/agents/robot_action_runtime_spec.md). A downstream implementer should be able to execute it without additional design decisions.
+Specification: [Closed-Loop Robot Agent Harness Specification](robot_action_runtime_spec.md).
 
 ## How to use this plan
 
-- Check an item only after its stated tests and acceptance criteria pass.
-- Work phases in order unless a phase explicitly says it may run in parallel.
-- Every behavior change follows red-green-refactor: add a failing test, implement the smallest passing change, then refactor with the suite green.
-- Do not weaken, delete, or skip an existing test to make a phase pass.
-- Tests must use deterministic clocks, IDs, fixtures, and event synchronization. Do not add fixed sleeps.
-- Tests own cleanup through fixtures or context managers.
-- Keep imports at module scope and do not add `__init__.py` re-exports.
-- Use `tmp_path` for journals and artifacts; runtime defaults use `STATE_DIR`.
-- Run the focused test listed for each phase before running broader regression tests.
+Implement the phases in order. Each phase should land with focused tests and leave ordinary DIMOS skills and MCP clients working. Navigation is the first physical vertical slice; do not generalize the metadata or lifecycle until that slice proves the interfaces.
 
-Progress legend: `[ ]` not started, `[x]` complete. If work is partially complete, leave the parent unchecked and check only finished child items.
+The plan deliberately concentrates on three outcomes:
+
+1. durable recording of standard tool calls and results;
+2. physical action tracking from command acceptance through observed outcome; and
+3. harness-managed world snapshots and model-context injection.
 
 ## Definition of done
 
-- [ ] The specification's prototype acceptance criteria all pass.
-- [ ] The built-in prototype dispatch path is native and does not make localhost MCP HTTP calls.
-- [ ] Existing MCP clients and ordinary uncontracted tools retain their standard schemas, call IDs, dispatch behavior, and result messages.
-- [ ] Unit, component, process-integration, and replay-data end-to-end tests pass without hardware or a live model.
-- [ ] No physical action is dispatched before its journal intent commit.
-- [ ] No physical resource is released before verified termination; unresolved actions leave affected resources unavailable and visible.
-- [ ] Replaying the immutable journal rebuilds identical projections without replaying physical commands.
-- [ ] Ruff, mypy, documentation-link checks, and the relevant pytest suites pass.
+The prototype is done when a deterministic mission can:
 
-## Prototype scope
+1. capture and inject current robot state before a model decision;
+2. receive an unchanged standard navigation tool call from the model;
+3. record the call and its immediate accepted result;
+4. correlate navigation progress and completion with that call;
+5. capture fresh state and verify the physical outcome;
+6. record the outcome and expose it to the next model turn; and
+7. reproduce the same ordered record in an integration test and a repository replay test.
 
-The prototype implements:
+## Scope
 
-- Standard tool-call compatibility with optional `PhysicalActionContract` routing for managed physical skills.
-- Immutable action records and the complete action state machine.
-- SQLite mission journal, snapshot storage, hash-chain validation, and immutable-table triggers.
-- Content-addressed local artifact storage.
-- Go2 world snapshots containing odometry, camera artifact reference, active actions, movement lease, and safety state; battery is optional because `go2_short.db` has no low-state stream.
-- Exclusive resource leases with action ownership, deadlines, heartbeats, and blocked unresolved ownership.
-- Freshness, precondition, resource, safety, and approval admission hooks.
-- Native skill dispatch with action correlation.
-- Typed progress, completion, and verification.
-- Journal-derived mission, active-action, unresolved-action, and LLM context projections.
-- Recorded-model and `go2_short.db` end-to-end tests.
-- One migrated production physical skill: `navigate_with_text`.
+In scope:
 
-The prototype does not implement generic physical-action cancellation, stop verification, restart reconciliation, automated recovery, physical-command replay, shared, capacity, or zone leases, fleet allocation, behavior trees, a remote journal, or cryptographic signatures.
+- a SQLite mission journal;
+- standard tool-call and tool-result recording;
+- snapshot cache, capture, persistence, and bounded projection;
+- optional robot-action metadata on existing skills;
+- typed robot action progress and terminal events;
+- physical action lifecycle and verification;
+- a serialized harness decision loop;
+- navigation migration as the initial vertical slice;
+- deterministic and replay-based tests.
 
-## Follow-up workstreams
+Out of scope:
 
-Cancellation is a separate workstream. It may build on stable action IDs, journal events, resource ownership, and robot-specific controller APIs from this prototype, but it owns stop contracts, `STOPPING` and `CANCELLED` states, timeout-driven stop decisions, stop verification, safety escalation, and release after cancellation.
+- a replacement for standard tools or MCP;
+- changes to existing capability coordination;
+- general resource arbitration or cross-client concurrency control;
+- approval and risk-policy systems;
+- cancellation and in-flight restart recovery;
+- multi-agent scheduling;
+- tamper-evident storage; and
+- migration of every physical skill in the prototype.
 
-Restart and recovery is a separate workstream. It may build on the append-only journal and unresolved-action projection, but it owns controller reconciliation, recovery snapshots, outcome repair events, operator-assisted clearance, and any explicitly authorized replay policy. The current prototype only exposes unresolved records and prevents automatic redispatch.
+## Proposed file layout
 
-## Planned file layout
+Use a focused package rather than adding more responsibilities to `McpClient`:
 
-The target layout is listed here so implementers do not invent competing locations. Split a file further if it becomes difficult to review, but preserve these public boundaries.
+```text
+dimos/agents/harness/
+├── __init__.py
+├── models.py                 # journal, snapshot, and action record types
+├── journal.py                # SQLite MissionJournal
+├── snapshots.py              # WorldSnapshotBuilder and snapshot schemas
+├── projections.py            # bounded model context
+├── tool_recording.py         # RecordedToolDispatcher
+├── robot_actions.py          # lifecycle, correlation, verification
+├── harness.py                # closed-loop coordinator
+├── harness_module.py         # DIMOS Module/blueprint integration
+└── testing.py                # scripted model and fake event helpers
+```
 
-| Path | Purpose |
+Tests should live beside the implementation using repository conventions. Existing files likely to receive narrow changes are:
+
+- `dimos/agents/annotation.py` for optional skill metadata;
+- `dimos/agents/mcp/mcp_client.py` for a clean integration seam, not a second implementation of the loop;
+- the navigation skill and its controller event source;
+- agentic blueprints that opt into the prototype; and
+- agent documentation describing the selected blueprint.
+
+Do not create all files before their phase needs them.
+
+## Test strategy
+
+Use three layers:
+
+- Unit tests for record schemas, state transitions, projection bounds, correlation, timeouts, and verifiers.
+- Process integration tests with a scripted model, fake skill proxy, real DIMOS streams/RPC wiring, and a temporary SQLite database.
+- Replay end-to-end tests using a small checked-in DIMOS replay and deterministic model outputs.
+
+Tests must never require a paid model call or physical robot.
+
+## Phase 0: baseline and integration seam
+
+### Work
+
+- Trace the current `McpClient` model/tool loop, tool-stream handling, and in-memory history.
+- Trace one navigation command from `@skill` through `set_goal()` and controller feedback.
+- Identify the typed streams needed for pose, navigation state, and terminal status.
+- Record current MCP schemas and representative results for regression fixtures.
+- Define how an agentic blueprint selects the new harness while the existing blueprint remains usable.
+
+### Tests and evidence
+
+- Add a regression fixture for an ordinary tool schema and navigation tool schema.
+- Add or identify a test showing that navigation currently returns after command start.
+- Document the event or adapter that can report navigation completion.
+
+### Exit criteria
+
+- The implementation seam is explicit.
+- No production behavior has changed.
+- The existing test suite is green.
+
+## Phase 1: persistent tool-call journal
+
+### Work
+
+- Define versioned journal envelopes with sequence, timestamp, mission ID, model-turn ID, event type, and correlation IDs.
+- Implement `MissionJournal` on SQLite with transactional append and ordered reads.
+- Implement records for model turn start, model response, standard tool call, and standard tool result.
+- Implement `RecordedToolDispatcher` around the existing dispatch interface.
+- Record the call before invoking the tool and exactly one result after it returns or raises.
+- Preserve the original tool name, arguments, call ID, schema, and result semantics.
+- Add configurable argument/result redaction without changing execution inputs.
+
+### Tests
+
+- append and ordered read;
+- close and reopen without record loss;
+- concurrent append serialization;
+- schema-version rejection with a useful error;
+- recorded successful ordinary tool call;
+- recorded tool exception as a standard error result;
+- original call ID and result content preserved; and
+- redaction affects storage only, not tool invocation.
+
+### Exit criteria
+
+- Every harness-dispatched standard tool call has a durable call and result record.
+- Ordinary tools behave exactly as before apart from recording.
+
+## Phase 2: harness-managed world snapshots
+
+### Work
+
+- Define `WorldSnapshot` and per-field freshness/provenance metadata.
+- Implement a latest-value cache fed by selected typed robot streams.
+- Support partial snapshots with explicit missing and stale values.
+- Store large sensor values as artifact references rather than inline journal payloads.
+- Persist a compact snapshot record before every model turn.
+- Implement `ProjectionBuilder` with field selection, age labels, artifact references, and a strict size budget.
+- Add capture triggers for post-action terminal events and selected salient robot events.
+- Coalesce high-rate updates so they update the cache without creating model turns.
+
+Start with the fields required by the navigation vertical slice:
+
+- current pose and velocity;
+- navigation/controller state;
+- active robot action and recent outcome; and
+- source timestamps and ages.
+
+Add battery, safety, perception, and artifact summaries only when the active blueprint exposes reliable sources.
+
+### Tests
+
+- latest source value wins;
+- capture freezes a consistent point-in-time view;
+- missing, stale, and current values remain distinguishable;
+- high-rate source events are coalesced;
+- artifact payloads are referenced rather than inlined;
+- projection remains within its configured budget; and
+- every model invocation receives a newly captured snapshot record.
+
+### Exit criteria
+
+- The harness, not the model, establishes baseline robot context for every decision.
+- The model can still invoke observation tools for additional information.
+
+## Phase 3: robot action tracking
+
+### Work
+
+- Extend `@skill` with optional `RobotActionMetadata` that does not affect generated MCP schemas.
+- Initially support metadata for:
+  - immediate result meaning: acceptance or completion;
+  - typed event/correlation source;
+  - verifier name;
+  - snapshot fields needed by the verifier; and
+  - execution timeout.
+- Define the lifecycle `REQUESTED`, `ACCEPTED`, `RUNNING`, `VERIFYING`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`.
+- Implement `RobotActionTracker` with tool-call ID and generated robot-action ID correlation.
+- Persist start, progress, transition, and outcome records.
+- Adapt controller feedback into typed events carrying enough identity to reject unrelated completions.
+- Treat timeout or ambiguous evidence as `UNKNOWN`, never success.
+
+The immediate standard tool result remains unique. If the result means acceptance, include the robot-action ID and accepted status. Record the later physical outcome separately and inject it into the next model turn.
+
+### Tests
+
+- an ordinary skill creates no robot action;
+- action metadata does not alter the standard tool schema;
+- an accepted command does not become `SUCCEEDED`;
+- correlated progress advances the correct action;
+- an unrelated terminal event cannot complete an action;
+- controller rejection becomes `FAILED`;
+- timeout becomes `UNKNOWN`;
+- duplicate events are idempotent; and
+- every transition retains the originating tool-call ID.
+
+### Exit criteria
+
+- The runtime can state separately whether a command was accepted and whether its physical outcome was verified.
+- Existing `@skill` declarations without metadata are unchanged.
+
+## Phase 4: closed-loop harness
+
+### Work
+
+- Implement `RobotAgentHarness` as a serialized event loop.
+- At each decision boundary:
+  1. capture and journal a snapshot;
+  2. construct bounded context from the snapshot and recent records;
+  3. invoke and record the model response;
+  4. record and dispatch standard tool calls; and
+  5. record each standard tool result.
+- Continue the conventional model/tool loop for ordinary tools.
+- When a managed physical command is accepted, close the current decision step and wait for its terminal event or timeout.
+- On terminal feedback, capture a fresh snapshot, run the verifier, record the outcome, and wake the next model decision.
+- Permit only one newly accepted managed physical action per decision step. Return structured standard tool errors for additional physical calls in the same model response.
+- Serialize model turns and debounce salient events.
+- Stop initiating physical work if the journal cannot persist the call or action record.
+
+### Tests
+
+- snapshot is recorded before model invocation;
+- ordinary tools can complete multiple normal tool-loop rounds;
+- accepted physical action pauses the next decision;
+- terminal event causes fresh snapshot capture and verification;
+- verified outcome appears in the next model context;
+- bursty events create only one serialized wakeup;
+- a second physical call in one step receives a standard structured error; and
+- journal failure prevents new physical dispatch.
+
+### Exit criteria
+
+- The observe-decide-act-observe/verify-decide loop works without the model explicitly polling for completion.
+- Standard tool semantics remain intact.
+
+## Phase 5: navigation vertical slice
+
+### Work
+
+- Add robot-action metadata to the selected navigation skill without changing its public tool schema.
+- Make its immediate result unambiguously report command rejection or acceptance and include the action ID through the dispatcher result envelope.
+- Emit or adapt typed navigation progress and terminal events with correlation data.
+- Implement a navigation verifier using:
+  - the correlated terminal event;
+  - fresh pose and navigation/controller state; and
+  - configured position/orientation tolerance.
+- Include goal, current pose, controller status, and reason in failed or unknown outcomes.
+- Add an opt-in agentic blueprint wiring the harness, snapshot sources, navigation event source, and native skill proxy.
+
+Do not change the repository's existing capability coordination behavior in this phase.
+
+### Tests
+
+- goal rejection records a failed action without claiming execution;
+- accepted goal enters `RUNNING` when feedback arrives;
+- goal-reached plus in-tolerance pose verifies `SUCCEEDED`;
+- goal-reached plus out-of-tolerance pose becomes `FAILED` or `UNKNOWN` according to verifier policy;
+- controller abort records `FAILED` with its reason;
+- missing terminal feedback times out to `UNKNOWN`; and
+- the same navigation skill remains callable through MCP.
+
+### Exit criteria
+
+- Navigation demonstrates the complete proposal using a normal model tool call.
+- No other physical skill is migrated merely to increase coverage.
+
+## Phase 6: deterministic and replay end-to-end tests
+
+### Deterministic process test
+
+Build a test blueprint containing:
+
+- a scripted model;
+- the real harness and SQLite journal;
+- a fake navigation skill/controller;
+- typed pose and navigation streams; and
+- controlled progress, completion, failure, and timeout events.
+
+The test should assert the exact causal order:
+
+```text
+snapshot
+model response
+tool call
+tool accepted result
+robot action progress
+terminal event
+fresh snapshot
+verified outcome
+next model turn
+```
+
+It should also reopen the journal and derive the same sequence without process memory.
+
+### Repository replay test
+
+Use the smallest suitable checked-in replay. If existing replay data lacks navigation terminal events, add a compact deterministic event fixture rather than depending on timing or a live controller.
+
+Assert that:
+
+- snapshot projections are deterministic for the replay;
+- the scripted model emits the expected standard tool call;
+- all calls and results are recorded;
+- the physical outcome is based on replayed event and snapshot evidence; and
+- the next decision receives the verified result.
+
+### Exit criteria
+
+- Both tests pass repeatedly without network access, a paid model, or hardware.
+- Failures show the journal sequence and correlation IDs.
+
+## Phase 7: regression and handoff
+
+### Work
+
+- Run focused harness, MCP, navigation, blueprint, and replay tests.
+- Run the repository's required fast test suite and static checks for changed packages.
+- Verify generated blueprint registry files if a built-in blueprint is added or renamed.
+- Document how to start the opt-in harness blueprint and inspect its mission journal.
+- Document snapshot freshness, accepted-versus-succeeded semantics, and verifier output.
+- Add a short guide for annotating the next physical skill only after navigation is stable.
+
+### Exit criteria
+
+- Existing non-harness agentic blueprints remain functional.
+- Existing external MCP clients need no protocol changes.
+- The new closed-loop behavior is opt-in and documented.
+- Deferred work is clearly separated from prototype requirements.
+
+## Required fault matrix
+
+Before completion, automated tests must cover:
+
+| Fault | Required result |
 |---|---|
-| `dimos/agents/runtime/models.py` | Frozen enums and domain records |
-| `dimos/agents/runtime/transitions.py` | Action transition validation |
-| `dimos/agents/runtime/journal.py` | Journal protocol and SQLite implementation |
-| `dimos/agents/runtime/artifacts.py` | Content-addressed artifact protocol and local implementation |
-| `dimos/agents/runtime/snapshots.py` | Harness-owned snapshot provider, persistence, freshness comparison, and repository API |
-| `dimos/agents/runtime/snapshot_module.py` | Go2 typed-stream cache and detached observation-draft RPC |
-| `dimos/agents/runtime/physical_action_contracts.py` | Physical action contract records, resolution, and predicate/verifier registries |
-| `dimos/agents/runtime/leases.py` | Exclusive lease manager |
-| `dimos/agents/runtime/admission.py` | Ordered admission gates and decisions |
-| `dimos/agents/runtime/executor.py` | Native `SkillsProxy` executor and execution handle |
-| `dimos/agents/runtime/action_events.py` | Typed event publisher/subscriber and legacy ToolStream adapter |
-| `dimos/agents/runtime/action_runner.py` | Action state machine orchestration |
-| `dimos/agents/runtime/action_runtime_spec.py` | RPC protocol used by native and MCP callers |
-| `dimos/agents/runtime/projections.py` | Deterministic journal projections |
-| `dimos/agents/runtime/harness.py` | Lifecycle-owning root and model-turn integration |
-| `dimos/agents/runtime/harness_module.py` | Coordinator module that owns one harness and exposes `ActionRuntimeSpec` |
-| `dimos/agents/runtime/testing.py` | Reusable deterministic fakes for runtime tests |
-| `dimos/agents/runtime/fixtures/` | Small recorded model responses only |
-| `dimos/cli/agent_harness.py` | Experimental native harness CLI |
-| `dimos/e2e_tests/test_agent_runtime_replay.py` | Recorded-data snapshot, admission, monitoring, and projection tests |
-
-Tests for each source file live beside it as `test_<name>.py`. Do not place implementation-only test helpers in `conftest.py`; reusable fakes belong in `dimos/agents/runtime/testing.py`.
-
-## Test layers
-
-| Layer | Dependencies | Purpose |
-|---|---|---|
-| Unit | Fake clock, deterministic ID source, in-memory collaborators | Models, transitions, freshness, leases, policies, projections |
-| Storage component | SQLite and local artifact directory under `tmp_path` | Transactions, immutability, hash chain, close and reopen |
-| Runtime component | Scripted executor, snapshot provider, verifier, safety policy | Full `ActionRunner` behavior and fault injection |
-| Process integration | DIMOS coordinator, modules, LCM, recorded `MockModel` | Native discovery, RPC, correlation, cleanup |
-| Replay-data end-to-end | `go2_short.db`, recorded `MockModel`, no hardware | Real camera/odometry streams, snapshots, admission, verification, projections |
-
-## Phase 0: baseline and scaffolding
-
-Goal: establish a clean baseline and package boundaries before behavior changes.
-
-- [ ] Record `git status --short` and preserve unrelated user changes.
-- [ ] Run `uv run pytest dimos/agents/mcp/test_mcp_client_unit.py dimos/agents/test_capabilities.py dimos/agents/mcp/test_tool_stream.py -v`.
-- [ ] Run `uv run mypy dimos/agents dimos/porcelain` and record any pre-existing failures separately.
-- [ ] Create `dimos/agents/runtime/` without `__init__.py` re-exports.
-- [ ] Add a test-only fake clock, deterministic ID source, snapshot provider, safety policy, executor, verifier, and event source in `testing.py`.
-- [ ] Ensure every fake records exact calls and supports event-based synchronization without sleeping.
-
-Phase acceptance:
-
-- [ ] Existing focused tests still pass.
-- [ ] Importing any new runtime module performs no I/O, starts no thread, and opens no database.
-
-## Phase 1: domain models and state transitions
-
-Goal: define immutable records and reject illegal state changes before adding storage or execution.
-
-### Red
-
-- [ ] Add tests that all persistent records are frozen and compare by value.
-- [ ] Add tests that nested argument, metadata, observation, and payload mappings cannot mutate a record after construction.
-- [ ] Add table-driven tests for every permitted action transition.
-- [ ] Add table-driven tests proving every unlisted transition is rejected.
-- [ ] Add tests for terminal-state detection and `UNKNOWN` classification.
-- [ ] Add tests that model arguments cannot populate trusted contract fields.
-- [ ] Add canonical JSON round-trip tests for every persisted enum and record.
-
-### Green
-
-- [ ] Implement string enums for risk, action state, event type, lease status, and next disposition; reuse existing `SkillInfo` lifecycle metadata rather than defining a competing execution-mode enum.
-- [ ] Implement frozen records for `ActionIntent`, `RequiredObservation`, `ResourceRequest`, `PhysicalActionContract`, `PreparedAction`, `ActionEvent`, `ActionOutcome`, `TimedObservation`, `ArtifactRef`, `WorldSnapshotDraft`, `WorldSnapshot`, and `JournalEvent`.
-- [ ] Implement explicit codec functions with schema versions. Do not persist `repr()` output or pickle.
-- [ ] Recursively freeze JSON mappings and sequences at record construction and thaw them only inside explicit codecs.
-- [ ] Implement one authoritative transition table and transition validator.
-- [ ] Reject non-JSON-compatible metadata at record construction or encoding time.
-
-### Refactor and acceptance
-
-- [ ] Remove duplicate string literals in favor of shared enums and constants.
-- [ ] Run `uv run pytest dimos/agents/runtime/test_models.py dimos/agents/runtime/test_transitions.py -v`.
-- [ ] Run `uv run mypy dimos/agents/runtime/models.py dimos/agents/runtime/transitions.py`.
-
-## Phase 2: append-only mission journal
-
-Goal: provide durable ordering, immutable snapshots, effect-intent persistence, and reliable close-and-reopen reads.
-
-### Red
-
-- [ ] Test that appends receive strictly increasing sequence numbers.
-- [ ] Test that events survive closing and reopening the SQLite store.
-- [ ] Test that canonical payloads produce a deterministic event hash chain.
-- [ ] In a copied test database, temporarily drop the immutability trigger, mutate an event with a raw SQLite connection, restore the trigger, and test that hash-chain verification fails on reopen.
-- [ ] Test that SQL `UPDATE` and `DELETE` against journal events are rejected by database triggers.
-- [ ] Test atomic insertion of a world snapshot and its `WORLD_SNAPSHOT_CAPTURED` event.
-- [ ] Test rollback leaves neither row when either half of snapshot persistence fails.
-- [ ] Test concurrent append callers produce a gap-free, unique order.
-- [ ] Test schema-version rejection for a database newer than the reader.
-- [ ] Test that a journal write failure is surfaced synchronously to the caller.
-
-### Green
-
-- [ ] Define a narrow `MissionJournal` protocol used by the runner and projection code.
-- [ ] Implement `SqliteMissionJournal` with explicit `start()` and `stop()` lifecycle.
-- [ ] Enable WAL and full synchronous durability on the runtime connection.
-- [ ] Allocate the next sequence under `BEGIN IMMEDIATE`; do not use a process-global counter.
-- [ ] Compute SHA-256 hashes over canonical envelope data plus the previous event hash.
-- [ ] Create insert-only triggers for `journal_events` and `world_snapshots`.
-- [ ] Store compact snapshot JSON and its digest in `world_snapshots`.
-- [ ] Add read APIs by mission, action, sequence range, and event type.
-- [ ] Add `verify_chain()` and call it whenever the journal opens.
-- [ ] Default runtime storage beneath `STATE_DIR / "agent_runtime"`; accept an explicit path in configuration.
-
-### Refactor and acceptance
-
-- [ ] Keep SQL migrations and canonical encoding centralized.
-- [ ] Ensure all connections and cursors are fixture-owned and closed on assertion failure.
-- [ ] Run `uv run pytest dimos/agents/runtime/test_journal.py -v`.
-- [ ] Run `uv run mypy dimos/agents/runtime/journal.py`.
-
-## Phase 3: artifact store and world snapshots
-
-Goal: assemble versioned snapshots from asynchronous inputs and persist large payloads by reference.
-
-### Red
-
-- [ ] Test that one capture time is used to calculate every observation age.
-- [ ] Test that capture returns a detached immutable value while new stream updates continue.
-- [ ] Test explicit missing observations; no placeholder pose, battery, or confidence is allowed.
-- [ ] Test that stale and fresh classifications use an injected monotonic clock.
-- [ ] Test that comparison examines only fields declared by a physical action contract.
-- [ ] Test that equal artifact bytes deduplicate to the same SHA-256 identifier.
-- [ ] Test that artifact metadata preserves media type, byte size, source time, and digest.
-- [ ] Test that snapshot persistence stores image references rather than image bytes.
-- [ ] Test snapshot version monotonicity after closing and reopening the journal.
-- [ ] Test that persistence failure prevents the snapshot from being returned as admissible.
-
-### Green
-
-- [ ] Implement a thread-safe snapshot-source assembler whose update and draft-capture paths use one lock, or an async single-owner equivalent.
-- [ ] Implement `LocalArtifactStore` with atomic temporary-file rename and content-addressed paths.
-- [ ] Implement the snapshot repository on top of the journal transaction API.
-- [ ] Implement required-field freshness evaluation and relevant-field diffing.
-- [ ] Implement the harness-owned `SnapshotProvider`: request a detached draft, merge action, lease, and safety projections, persist artifacts, then atomically persist the versioned snapshot and journal event.
-- [ ] Implement `SnapshotSource` and `ArtifactStore` protocols for test injection.
-- [ ] Implement `WorldSnapshotModule` with typed `odom` and `color_image` inputs and registered disposable subscriptions.
-- [ ] Add optional battery and navigation-state inputs without fabricating values when a replay lacks them.
-- [ ] Expose an RPC that returns a detached observation draft with one capture time and a supplied trigger. The module must not open or write the mission journal.
-- [ ] Keep version allocation and the merge of active actions, resource ownership, and safety state in the harness-owned provider so the journal retains one writer.
-
-### Refactor and acceptance
-
-- [ ] Keep image serialization outside message types and snapshot records.
-- [ ] Verify `start()` owns subscriptions and `stop()` calls `super().stop()` and releases them.
-- [ ] Run `uv run pytest dimos/agents/runtime/test_artifacts.py dimos/agents/runtime/test_snapshots.py dimos/agents/runtime/test_snapshot_module.py -v`.
-- [ ] Run `uv run mypy dimos/agents/runtime/artifacts.py dimos/agents/runtime/snapshots.py dimos/agents/runtime/snapshot_module.py`.
-
-## Phase 4: physical-action-contract discovery
-
-Goal: add optional managed-physical-execution metadata without changing standard tool behavior, current decorators, MCP, or native discovery.
-
-### Red
-
-- [ ] Test bare `@skill` retains its current schema, RPC behavior, and default metadata.
-- [ ] Test existing `@skill(uses=[...], lifecycle=...)` remains compatible.
-- [ ] Test an uncontracted tool uses the ordinary dispatcher, preserves its standard tool-call ID and result message, and does not create an `ActionIntent`.
-- [ ] Test a contracted physical skill exposes every required `PhysicalActionContract` field through core `SkillInfo` without changing its model-visible tool schema.
-- [ ] Test invalid physical action contracts fail during class or module setup, before the robot can run.
-- [ ] Test a physical action contract without resources, execution timeout, or verifier is rejected.
-- [ ] Test the physical action contract cannot redefine the standard tool name, description, argument schema, call ID, result envelope, or lifecycle.
-- [ ] Test the model-visible schema cannot override trusted contract metadata.
-- [ ] Test native and MCP dispatch resolve the same server-side physical action contract ID and version without exposing that contract in the standard model-facing schema.
-- [ ] Test only tools with a valid physical action contract can enter the physical runner.
-
-### Green
-
-- [ ] Extend `skill()` with one optional typed `PhysicalActionContract` argument while preserving both existing decorator forms and standard tool-call behavior.
-- [ ] Attach the immutable contract to the RPC wrapper and include it in core `SkillInfo`.
-- [ ] Update module skill discovery and serialization for the new optional fields.
-- [ ] Update `SkillsProxy` to expose skill info to `PhysicalActionContractRegistry` without reaching into private fields.
-- [ ] Keep MCP `tools/list` output backward compatible; resolve physical action contracts only in trusted server-side dispatch.
-- [ ] Implement `PhysicalActionContractRegistry` with live refresh and ambiguity detection matching `SkillsProxy` behavior.
-- [ ] Implement named predicate and verifier registries owned by the harness root.
-
-### Refactor and acceptance
-
-- [ ] Do not duplicate `SkillInfo` definitions; reconcile or clearly separate the core RPC record from UI introspection metadata.
-- [ ] Add core skill-discovery cases in `dimos/core/test_module_skills.py` and run `uv run pytest dimos/agents/test_annotation.py dimos/core/test_module_skills.py dimos/porcelain/test_skills_proxy.py dimos/agents/mcp/test_mcp_server.py -v`.
-- [ ] Run `uv run mypy dimos/agents/annotation.py dimos/core/module.py dimos/porcelain/skills_proxy.py`.
-
-## Phase 5: leases and admission
-
-Goal: guarantee one owner for physical resources and make all pre-dispatch gates deterministic.
-
-### Red
-
-- [ ] Test atomic acquisition of multiple exclusive resources.
-- [ ] Test that a conflict acquires none of the requested resources.
-- [ ] Test renew and release require the owning action ID and lease token.
-- [ ] Test an expired lease blocks automatic resource reuse and surfaces the owning action as unresolved; it does not invoke a generic stop or recovery workflow.
-- [ ] Test model actions cannot preempt another normal action in the prototype.
-- [ ] Test admission rejects missing and stale required observations without invoking the executor.
-- [ ] Test unrelated snapshot changes do not reject the action.
-- [ ] Test relevant changes force revalidation after approval or lease wait.
-- [ ] Test safety constraints can reduce an action but never expand its contract limits.
-- [ ] Test every rejection contains a stable code and journal event.
-- [ ] Test provisional leases are released when final revalidation fails.
-
-### Green
-
-- [ ] Implement a harness-owned `LeaseManager` using a lock and injected monotonic clock.
-- [ ] Represent ownership with action ID, opaque token, deadline, heartbeat time, priority, and status; distinguish active, expired, and blocked from available.
-- [ ] Implement acquire, renew, verified release, snapshot, and conflict operations.
-- [ ] Implement ordered admission gates: schema, initial snapshot, preconditions, safety, approval, lease acquisition, final snapshot revalidation, final safety.
-- [ ] Return immutable `AdmissionDecision` values with stable reason codes.
-- [ ] Journal all approval, safety, and lease transitions.
-- [ ] Add an `ActionRuntimeSpec` RPC boundary owned by the harness root. Native and MCP callers use this same boundary for contracted physical actions.
-- [ ] Update `McpServer` so contracted physical calls route through `ActionRuntimeSpec` and skip direct RPC dispatch and `CapabilityRegistry`; uncontracted calls retain their ordinary path and standard MCP responses.
-- [ ] Test that a native call and an MCP call for `base.motion` conflict through the same `LeaseManager`, proving there is no split ownership.
-
-### Refactor and acceptance
-
-- [ ] Keep lease state grouped in one record and lock every read and write.
-- [ ] Run `uv run pytest dimos/agents/runtime/test_leases.py dimos/agents/runtime/test_admission.py -v`.
-- [ ] Run `uv run mypy dimos/agents/runtime/leases.py dimos/agents/runtime/admission.py`.
-
-## Phase 6: native execution and typed action events
-
-Goal: invoke skills without MCP HTTP and preserve action correlation through progress and completion.
-
-### Red
-
-- [ ] Test `SkillsProxyExecutor` resolves exactly one skill and passes canonical arguments.
-- [ ] Test the executor injects the harness action ID into trusted call context, not the model arguments.
-- [ ] Test synchronous success, synchronous structured failure, RPC exception, timeout, and lost-response outcomes.
-- [ ] Test background invocation returns a handle before physical completion.
-- [ ] Test two concurrent invocations of the same skill are distinguished by action ID.
-- [ ] Test typed action events preserve event type, progress, source time, status code, and action ID.
-- [ ] Test the legacy ToolStream adapter preserves `progressToken` correlation instead of reducing it to tool name.
-- [ ] Test uncorrelated legacy messages are operator logs and cannot settle an action.
-- [ ] Test terminal events are delivered before stream teardown.
-
-### Green
-
-- [ ] Define `SkillExecutor` and `ActionEventSource` protocols.
-- [ ] Implement `SkillsProxyExecutor` using `Dimos.connect()` and public `SkillsProxy` APIs.
-- [ ] Run blocking RPC calls in a bounded worker owned and stopped by the executor.
-- [ ] Extend skill call context with `action_id` while retaining MCP progress-token behavior.
-- [ ] Implement typed action event publication over the configured DIMOS transport.
-- [ ] Implement a migration adapter from ToolStream progress notifications to `ActionEvent`.
-- [ ] Ensure executor shutdown cancels waits, closes the remote connection, and joins owned workers.
-
-### Refactor and acceptance
-
-- [ ] Keep transport encoding separate from action state-machine logic.
-- [ ] Run `uv run pytest dimos/agents/runtime/test_executor.py dimos/agents/runtime/test_action_events.py dimos/agents/mcp/test_tool_stream.py -v`.
-- [ ] Run `uv run mypy dimos/agents/runtime/executor.py dimos/agents/runtime/action_events.py`.
-
-## Phase 7: `ActionRunner`
-
-Goal: implement the complete prepared-action transaction and failure semantics.
-
-### Red
-
-- [ ] Happy path: assert the exact event subsequence from proposal through verified success.
-- [ ] Assert preparation performs no executor call, lease acquisition, or physical side effect.
-- [ ] Assert dispatch does not occur when the pre-dispatch journal append fails.
-- [ ] Assert dispatch occurs only after `ACTION_DISPATCH_REQUESTED` is durable.
-- [ ] Assert a synchronous RPC success enters verification rather than directly settling a physical action.
-- [ ] Assert completion events with the wrong action ID are ignored and journaled as diagnostics.
-- [ ] Assert a failed verifier produces `FAILED` or `UNKNOWN` without starting a generic recovery procedure.
-- [ ] Assert an execution timeout produces `ACTION_UNKNOWN`, leaves affected resources unavailable, and does not invoke a generic stop handler.
-- [ ] Assert a lost dispatch response produces `ACTION_UNKNOWN` and no automatic retry.
-- [ ] Assert two admitted actions with disjoint resources may execute concurrently while conflicting actions cannot.
-- [ ] Assert all exit paths release nonphysical resources and close subscriptions.
-- [ ] Assert only a proven pre-invocation failure settles `FAILED`; ambiguous RPC delivery settles `UNKNOWN` and keeps affected resources blocked.
-
-### Green
-
-- [ ] Implement `ActionPreparer` as a pure dependency of the runner.
-- [ ] Implement `ActionRunner` with one transition function and one cleanup path.
-- [ ] Persist every state transition before publishing it to projections or UI.
-- [ ] Capture decision, admission, and verification snapshots at the specified boundaries.
-- [ ] Monitor the event source and execution timeout concurrently without implementing physical cancellation.
-- [ ] Invoke verifiers through the trusted registry using a fresh snapshot.
-- [ ] Return a structured `ActionOutcome` for every terminal path.
-- [ ] Mark ambiguous or timed-out actions unresolved, block automatic resource reuse, and expose them to projections.
-- [ ] Ensure fatal post-dispatch journal failure revokes further dispatch authority and surfaces an unresolved fatal condition without claiming that hardware was stopped.
-
-### Refactor and acceptance
-
-- [ ] Keep policy, persistence, execution, and verification behind injected protocols.
-- [ ] Ensure there is no broad `except Exception` around the complete run method.
-- [ ] Run `uv run pytest dimos/agents/runtime/test_action_runner.py -v`.
-- [ ] Run `uv run mypy dimos/agents/runtime/action_runner.py`.
-
-## Phase 8: projections and unresolved-action visibility
-
-Goal: rebuild agent-facing state from immutable history and expose interrupted actions without implementing controller reconciliation.
-
-### Red
-
-- [ ] Test mission-state projection from an empty journal and from a complete successful mission.
-- [ ] Test active-action and lease projections for every transition.
-- [ ] Test progress coalescing keeps the latest routine update while retaining safety and terminal events.
-- [ ] Test the LLM projection includes goal, constraints, snapshot version, relevant observations, active actions, resources, salient events, unknown effects, and decision question.
-- [ ] Test deterministic event replay produces byte-equivalent canonical projection output.
-- [ ] Delete projection checkpoints and test that replay rebuilds the same state.
-- [ ] Test reopening the journal identifies `DISPATCHING`, `EXECUTING`, and `VERIFYING` actions as unresolved.
-- [ ] Test recorded unresolved actions are exposed and never automatically dispatched again.
-- [ ] Test projection rebuilding performs no controller query, stop request, outcome reconciliation, or physical-command replay.
-- [ ] Test corrupted journal startup fails before any executor is available.
-
-### Green
-
-- [ ] Implement pure fold functions for mission, active-action, lease, unresolved-action, and LLM projections.
-- [ ] Implement deterministic salience and progress-coalescing rules.
-- [ ] Add optional rebuildable projection checkpoints only after replay behavior passes.
-- [ ] Mark recorded unresolved commands as non-dispatchable without attempting to settle them.
-- [ ] Expose unresolved and unknown actions in both operator and model projections.
-
-### Refactor and acceptance
-
-- [ ] Ensure projections never perform robot I/O or append journal events.
-- [ ] Run `uv run pytest dimos/agents/runtime/test_projections.py -v`.
-- [ ] Run `uv run mypy dimos/agents/runtime/projections.py`.
-
-## Phase 9: model loop and harness lifecycle
-
-Goal: integrate the runtime with a bounded model decision loop while keeping durable state outside chat history.
-
-### Red
-
-- [ ] Test a recorded `MockModel` response containing an ordinary tool call is journaled with its standard tool-call ID.
-- [ ] Test an uncontracted query tool uses the ordinary dispatcher, returns its normal structured tool result, and creates neither an `ActionIntent` nor a physical lease.
-- [ ] Test a contracted physical tool call becomes one `ActionIntent` tied to the decision snapshot and the unchanged standard tool-call ID.
-- [ ] Test physical tool wrappers call `ActionRunner`, never `SkillsProxy` directly.
-- [ ] Test a physical `ActionOutcome` is encoded into a standard tool-result message associated with the original tool-call ID rather than returned as raw controller prose.
-- [ ] Test a safety or unknown event is surfaced to the model without initiating generic cancellation or recovery.
-- [ ] Test routine progress does not trigger an LLM turn.
-- [ ] Test user steering can cancel a model turn without falsely marking a robot action stopped.
-- [ ] Test harness startup exposes recorded unresolved actions and does not automatically redispatch them.
-- [ ] Test harness shutdown cancels model work and closes subscriptions and stores without claiming that active physical actions were stopped.
-
-### Green
-
-- [ ] Implement `RobotAgentHarness` as the root owner of model adapter, standard tool dispatcher, journal, snapshot provider, physical action contracts, leases, executor, runner, and projections.
-- [ ] Implement `RobotAgentHarnessModule` as the sole coordinator-visible lifecycle owner of one `RobotAgentHarness` and the `ActionRuntimeSpec` RPC implementation.
-- [ ] Reuse LangGraph or the existing model abstraction only as the bounded decision loop; do not use chat history as mission state.
-- [ ] Generate standard model tools from native skill discovery without changing their schemas; wrap only tools with a `PhysicalActionContract` using `ActionRunner`.
-- [ ] Expose the same contracted physical action entrypoint to `McpServer` through `ActionRuntimeSpec`; do not maintain a separate MCP action runner.
-- [ ] Record projection digest, model response, and tool calls after redaction.
-- [ ] Implement bounded context construction from projections and artifact references.
-- [ ] Add explicit start and stop lifecycle and no import-time work.
-- [ ] Add the experimental `dimos agent-harness` CLI that connects to the `RobotAgentHarnessModule` in an already running DIMOS coordinator; fail clearly if the running blueprint does not contain the host module, and never create a second local runtime.
-- [ ] Register the command in `dimos/cli/dimos.py` and cover command discovery in the existing CLI startup tests.
-- [ ] Put model-fixture and journal-path configuration on the host module or blueprint. Support noninteractive one-message execution in the CLI without letting a CLI client replace those runtime-owned settings after startup.
-
-### Refactor and acceptance
-
-- [ ] Verify the native path performs no POST to the MCP server.
-- [ ] Run `uv run pytest dimos/agents/runtime/test_harness.py dimos/cli/test_agent_harness.py dimos/cli/test_cli_startup.py -v`.
-- [ ] Run `uv run mypy dimos/agents/runtime/harness.py dimos/cli/agent_harness.py`.
-
-## Phase 10: migrate navigation as the vertical slice
-
-Goal: demonstrate a real DIMOS physical skill whose resource ownership spans dispatch through verified completion.
-
-### Red
-
-- [ ] Reproduce the existing issue where `navigate_with_text` releases movement after `set_goal()` returns.
-- [ ] Test the migrated `PhysicalActionContract` declares exclusive base movement, freshness bounds, execution timeout, and verifier.
-- [ ] Test tagged-location and semantic-map navigation return a correlated background action rather than claiming completion.
-- [ ] Test goal-reached produces a correlated completion report.
-- [ ] Test navigation success is verified from a fresh pose and zero-motion or idle-controller evidence.
-- [ ] Test follow, patrol, or exploration cannot acquire movement while navigation is executing.
-- [ ] Test stale odometry rejects navigation before `set_goal()`.
-
-### Green
-
-- [ ] Add action ID propagation from the runner context into `NavigationSkillContainer`.
-- [ ] Refactor `navigate_with_text` so starting a goal has a background lifecycle for every asynchronous path.
-- [ ] Emit typed navigation started, progress where meaningful, completion, and failure events.
-- [ ] Preserve the existing user-visible tool name, schema, call ID, and MCP result behavior.
-- [ ] Add a trusted navigation verifier that checks controller state and target tolerance using a fresh snapshot.
-- [ ] Route migrated movement ownership through `LeaseManager` and disable duplicate `CapabilityRegistry` acquisition for both native and MCP contracted action paths.
-- [ ] Keep path planning, obstacle avoidance, and velocity control inside existing navigation modules.
-
-### Refactor and acceptance
-
-- [ ] Run `uv run pytest dimos/agents/skills/test_navigation.py dimos/navigation/replanning_a_star/test_global_planner.py dimos/navigation/basic_path_follower/test_module.py -v`.
-- [ ] Run `uv run pytest dimos/agents/runtime/test_navigation_action.py -v`.
-- [ ] Run `uv run mypy dimos/agents/skills/navigation.py dimos/agents/runtime`.
-
-## Phase 11: deterministic process-integration test
-
-Goal: prove the complete model-to-action-to-projection flow without LFS, hardware, or a live model.
-
-- [ ] Add `dimos/agents/runtime/fixtures/test_scripted_navigation_mission.json` containing recorded `MockModel` responses.
-- [ ] Add an ordinary uncontracted query tool and assert it preserves its standard call/result correlation, creates no `ActionIntent`, and acquires no physical lease.
-- [ ] Add a scripted physical skill module that emits typed progress and changes a fake world state using event synchronization.
-- [ ] Compose the scripted module, snapshot module, `RobotAgentHarnessModule`, and recorded model through a real `ModuleCoordinator`.
-- [ ] Send one mission input: navigate to the scripted target.
-- [ ] Assert exact journal ordering: decision snapshot, tool proposal, preparation, provisional lease, admission snapshot, admission grant, dispatch intent, acceptance, progress, completion report, verification snapshot, success, release.
-- [ ] Assert the final LLM projection reports success and contains no raw high-rate state.
-- [ ] Assert no MCP HTTP server is required.
-- [ ] Assert fixture teardown stops the coordinator, transports, worker pool, executor, journal, and artifact store even on failure.
-- [ ] Run `uv run pytest dimos/agents/runtime/test_harness_integration.py -v`.
-
-## Phase 12: repository-sample replay end-to-end tests
-
-Goal: validate real recorded camera and odometry flow using repository sample data.
-
-Create `dimos/e2e_tests/test_agent_runtime_replay.py`. Mark tests that require LFS data with the repository's appropriate slow or self-hosted marker so the default suite remains fast. Resolve data through `get_data("go2_short.db")`; never hardcode a downloaded path.
-
-### E2E A: replay snapshot persistence
-
-- [ ] Start a replay connection over `go2_short.db` with a short bounded duration and no viewer.
-- [ ] Subscribe the snapshot module to real replayed odometry and camera streams.
-- [ ] Wait with events until both fields have arrived.
-- [ ] Capture decision and admission snapshots at two different replay points.
-- [ ] Assert increasing world versions, increasing source times, non-placeholder poses, bounded calculated ages, and content-addressed camera references.
-- [ ] Reopen the SQLite journal and assert both snapshots and their capture events are intact.
-
-### E2E B: stale-world admission
-
-- [ ] Prepare a navigation action from a valid replay snapshot.
-- [ ] Advance the injected admission clock beyond the odometry freshness bound without injecting a new odometry message.
-- [ ] Run admission and assert a stable `STALE_OBSERVATION` rejection.
-- [ ] Assert no navigation RPC was called, no movement lease remains, and the rejection references both snapshot versions.
-
-### E2E C: replay-driven monitored action
-
-- [ ] Use a test controller adapter that treats a later recorded odometry pose as its target and emits completion when replay reaches it.
-- [ ] Use a recorded `MockModel` fixture to propose the navigation tool call.
-- [ ] Assert movement ownership spans dispatch through fresh-snapshot verification.
-- [ ] Assert progress is coalesced for model context but fully available in the operator timeline.
-- [ ] Assert the final outcome is physically verified from the replayed pose, not from the controller report alone.
-
-### E2E D: projection rebuild
-
-- [ ] Delete only `projection_checkpoints` after the replay mission.
-- [ ] Reopen the journal and rebuild all projections.
-- [ ] Assert canonical mission, action, lease, unresolved-action, and LLM projections equal those captured before shutdown.
-- [ ] Assert projection rebuilding performs no skill invocation or physical-command replay.
-
-Replay acceptance commands:
-
-- [ ] Run `uv run pytest -m self_hosted dimos/e2e_tests/test_agent_runtime_replay.py -v` after the LFS fixture is available.
-- [ ] Run the same file twice to prove journal and test cleanup isolation.
-- [ ] Confirm the tests make no OpenAI request and use no robot or simulator process.
-
-## Phase 13: regression, documentation, and handoff
-
-Goal: leave a reviewable prototype with reproducible evidence.
-
-- [ ] Run all new runtime tests: `uv run pytest dimos/agents/runtime -v`.
-- [ ] Run MCP regressions: `uv run pytest dimos/agents/mcp dimos/agents/test_capabilities.py -v`.
-- [ ] Run native proxy regressions: `uv run pytest dimos/porcelain -v`.
-- [ ] Run navigation regressions selected in Phase 10.
-- [ ] Run the replay end-to-end suite from Phase 12.
-- [ ] Run `uv run mypy dimos/agents/runtime dimos/agents/annotation.py dimos/core/module.py dimos/porcelain/skills_proxy.py dimos/agents/skills/navigation.py`.
-- [ ] Run `uv run ruff format --check dimos/agents/runtime dimos/agents/annotation.py dimos/core/module.py dimos/porcelain/skills_proxy.py dimos/agents/skills/navigation.py`.
-- [ ] Run `uv run ruff check dimos/agents/runtime dimos/agents/annotation.py dimos/core/module.py dimos/porcelain/skills_proxy.py dimos/agents/skills/navigation.py`.
-- [ ] Run `doclinks docs/capabilities/agents/robot_action_runtime_spec.md docs/capabilities/agents/robot_action_runtime_implementation_plan.md`.
-- [ ] Run `md-babel-py run docs/capabilities/agents/robot_action_runtime_spec.md --dry-run` and the same command for this plan.
-- [ ] Regenerate `dimos/robot/all_blueprints.py` with `pytest dimos/robot/test_all_blueprints_generation.py` if a runnable built-in blueprint was added.
-- [ ] Document the exact passing commands and any excluded platform-specific tests in the final handoff.
-- [ ] Capture one example mission journal and render its action timeline for the final demonstration.
-
-## Required fault-injection matrix
-
-The following cases must be covered before declaring the prototype complete:
-
-| Fault | Injection point | Required assertion |
-|---|---|---|
-| Stale odometry | Before final admission | Rejected; executor call count zero |
-| Relevant world change | During approval or lease wait | Revalidated or rejected against new snapshot |
-| Resource conflict | Lease acquisition | Only one action owns movement |
-| Journal failure | Before dispatch | No physical call occurs |
-| Lost RPC response | Immediately after executor receives call | Outcome unknown; no automatic retry |
-| Controller failure | During execution | Structured failure or unknown outcome; no generic recovery starts |
-| Progress disconnect | While action runs | Outcome unknown unless another trusted completion source proves it |
-| Execution timeout | No terminal event | Outcome unknown; affected resources remain unavailable; no generic cancellation starts |
-| Verification mismatch | Controller claims success at wrong pose | Action does not succeed |
-| Corrupt journal | Before startup | Startup fails before skill dispatch is available |
-| Artifact write failure | During snapshot capture | Snapshot is not admissible or journaled as complete |
+| Tool raises before command acceptance | one recorded standard error result; action `FAILED` if created |
+| Controller rejects command | accepted is false; action `FAILED` |
+| Progress arrives for another action | event retained for diagnosis; target action unchanged |
+| Terminal event never arrives | action `UNKNOWN` after timeout |
+| Terminal success conflicts with fresh pose | verifier returns `FAILED` or `UNKNOWN` with evidence |
+| Snapshot field is missing or stale | explicit in projection and verifier input |
+| Journal append fails before physical dispatch | physical tool is not invoked |
+| Duplicate progress or terminal event | no duplicate transition or second model turn |
+| Model requests two physical actions in one step | first may proceed; later call gets a standard structured error |
 
 ## Review checklist
 
-Architecture:
-
-- [ ] One root object owns component lifecycle.
-- [ ] No global mutable action, lease, snapshot, or journal registry exists.
-- [ ] Model, policy, persistence, and execution responsibilities are separated.
-- [ ] High-rate control remains inside robot controllers.
-- [ ] MCP compatibility is preserved without granting MCP safety authority.
-
-Correctness:
-
-- [ ] Every physical effect has a durable pre-effect intent.
-- [ ] Every action and event is correlated by action ID.
-- [ ] Every success has verifier evidence and a verification snapshot.
-- [ ] Relevant observation freshness is checked after waits.
-- [ ] Unresolved physical commands remain visible and are never automatically redispatched.
-
-Persistence:
-
-- [ ] Journal and snapshots reject update and delete.
-- [ ] Hash-chain validation runs whenever the journal opens.
-- [ ] Snapshot and capture event are atomic.
-- [ ] Large artifacts are referenced, not embedded.
-- [ ] Projection checkpoints are disposable and rebuildable.
-
-Testing:
-
-- [ ] Tests use injected clocks and IDs.
-- [ ] Tests contain assertions and no prints.
-- [ ] Async tests use events or bounded polling, not fixed sleeps.
-- [ ] Fixtures clean up databases, transports, modules, processes, and threads.
-- [ ] Recorded model fixtures remove live-model nondeterminism.
-- [ ] Replay tests use `get_data("go2_short.db")`.
+- Standard tool calls remain the canonical invocation.
+- Every dispatched call has exactly one standard result.
+- Recording covers ordinary as well as physical tools.
+- `@skill` metadata is optional and does not alter MCP schemas.
+- Command acceptance is never labeled physical success.
+- Robot action events carry usable correlation IDs.
+- Verification uses a fresh snapshot.
+- Snapshot capture is harness-managed at every model boundary.
+- Raw high-rate sensor payloads are not injected into model context.
+- Missing and stale state are explicit.
+- Model turns are serialized and event wakeups are bounded.
+- Navigation proves the vertical slice before broader migration.
+- Resource coordination, cancellation, and restart recovery remain outside this plan.
 
 ## Recommended delivery order
 
-For a time-bounded implementation, the first reviewable milestone is Phases 0 through 8, Phase 11, and E2E A through D. That milestone demonstrates the design with a scripted physical skill but is not the final definition of done. The completed prototype also includes the production navigation migration in Phase 10; if it cannot be completed safely within the time box, leave its checklist open and describe the submission as a vertical runtime prototype rather than a finished DIMOS integration.
+Land the work as small, reviewable changes:
 
-Do not cut journal durability, stale-state rejection, resource ownership, or physical verification to add UI polish. Cancellation and restart recovery are explicitly separate workstreams built on the durable records and action identity established here.
+1. journal records and recorded standard tool dispatch;
+2. snapshot cache, capture, persistence, and projection;
+3. optional action metadata and tracker;
+4. serialized harness loop;
+5. navigation vertical slice;
+6. deterministic process integration test;
+7. repository replay test and documentation.
+
+Each change should preserve existing agent behavior until an agentic blueprint explicitly selects the new harness.
