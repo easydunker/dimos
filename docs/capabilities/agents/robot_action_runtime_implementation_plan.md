@@ -27,10 +27,10 @@ Progress legend: `[ ]` not started, `[x]` complete. If work is partially complet
 - [ ] The specification's prototype acceptance criteria all pass.
 - [ ] The built-in prototype dispatch path is native and does not make localhost MCP HTTP calls.
 - [ ] Existing MCP clients and ordinary uncontracted tools retain their standard schemas, call IDs, dispatch behavior, and result messages.
-- [ ] Unit, component, process-integration, recovery, and replay end-to-end tests pass without hardware or a live model.
+- [ ] Unit, component, process-integration, and replay-data end-to-end tests pass without hardware or a live model.
 - [ ] No physical action is dispatched before its journal intent commit.
-- [ ] No physical resource is released before verified termination or explicit unknown-state escalation.
-- [ ] The replayable journal rebuilds identical projections after restart.
+- [ ] No physical resource is released before verified termination; unresolved actions leave affected resources unavailable and visible.
+- [ ] Replaying the immutable journal rebuilds identical projections without replaying physical commands.
 - [ ] Ruff, mypy, documentation-link checks, and the relevant pytest suites pass.
 
 ## Prototype scope
@@ -42,15 +42,21 @@ The prototype implements:
 - SQLite mission journal, snapshot storage, hash-chain validation, and immutable-table triggers.
 - Content-addressed local artifact storage.
 - Go2 world snapshots containing odometry, camera artifact reference, active actions, movement lease, and safety state; battery is optional because `go2_short.db` has no low-state stream.
-- Exclusive resource leases with action ownership, deadlines, heartbeats, and emergency revocation.
+- Exclusive resource leases with action ownership, deadlines, heartbeats, and blocked unresolved ownership.
 - Freshness, precondition, resource, safety, and approval admission hooks.
 - Native skill dispatch with action correlation.
-- Typed progress, completion, cancellation, and verification.
-- Journal-derived mission, active-action, recovery, and LLM context projections.
+- Typed progress, completion, and verification.
+- Journal-derived mission, active-action, unresolved-action, and LLM context projections.
 - Recorded-model and `go2_short.db` end-to-end tests.
 - One migrated production physical skill: `navigate_with_text`.
 
-The prototype does not implement shared, capacity, or zone leases; fleet allocation; behavior trees; a remote journal; or cryptographic signatures.
+The prototype does not implement generic physical-action cancellation, stop verification, restart reconciliation, automated recovery, physical-command replay, shared, capacity, or zone leases, fleet allocation, behavior trees, a remote journal, or cryptographic signatures.
+
+## Follow-up workstreams
+
+Cancellation is a separate workstream. It may build on stable action IDs, journal events, resource ownership, and robot-specific controller APIs from this prototype, but it owns stop contracts, `STOPPING` and `CANCELLED` states, timeout-driven stop decisions, stop verification, safety escalation, and release after cancellation.
+
+Restart and recovery is a separate workstream. It may build on the append-only journal and unresolved-action projection, but it owns controller reconciliation, recovery snapshots, outcome repair events, operator-assisted clearance, and any explicitly authorized replay policy. The current prototype only exposes unresolved records and prevents automatic redispatch.
 
 ## Planned file layout
 
@@ -77,7 +83,7 @@ The target layout is listed here so implementers do not invent competing locatio
 | `dimos/agents/runtime/testing.py` | Reusable deterministic fakes for runtime tests |
 | `dimos/agents/runtime/fixtures/` | Small recorded model responses only |
 | `dimos/cli/agent_harness.py` | Experimental native harness CLI |
-| `dimos/e2e_tests/test_agent_runtime_replay.py` | Replay and restart acceptance tests |
+| `dimos/e2e_tests/test_agent_runtime_replay.py` | Recorded-data snapshot, admission, monitoring, and projection tests |
 
 Tests for each source file live beside it as `test_<name>.py`. Do not place implementation-only test helpers in `conftest.py`; reusable fakes belong in `dimos/agents/runtime/testing.py`.
 
@@ -86,10 +92,10 @@ Tests for each source file live beside it as `test_<name>.py`. Do not place impl
 | Layer | Dependencies | Purpose |
 |---|---|---|
 | Unit | Fake clock, deterministic ID source, in-memory collaborators | Models, transitions, freshness, leases, policies, projections |
-| Storage component | SQLite and local artifact directory under `tmp_path` | Transactions, immutability, hash chain, restart |
+| Storage component | SQLite and local artifact directory under `tmp_path` | Transactions, immutability, hash chain, close and reopen |
 | Runtime component | Scripted executor, snapshot provider, verifier, safety policy | Full `ActionRunner` behavior and fault injection |
 | Process integration | DIMOS coordinator, modules, LCM, recorded `MockModel` | Native discovery, RPC, correlation, cleanup |
-| Replay end-to-end | `go2_short.db`, recorded `MockModel`, no hardware | Real camera/odometry streams, snapshots, journal, recovery |
+| Replay-data end-to-end | `go2_short.db`, recorded `MockModel`, no hardware | Real camera/odometry streams, snapshots, admission, verification, projections |
 
 ## Phase 0: baseline and scaffolding
 
@@ -123,7 +129,7 @@ Goal: define immutable records and reject illegal state changes before adding st
 
 ### Green
 
-- [ ] Implement string enums for risk, physical-action replay policy, action state, event type, lease status, and next disposition; reuse existing `SkillInfo` lifecycle metadata rather than defining a competing execution-mode enum.
+- [ ] Implement string enums for risk, action state, event type, lease status, and next disposition; reuse existing `SkillInfo` lifecycle metadata rather than defining a competing execution-mode enum.
 - [ ] Implement frozen records for `ActionIntent`, `RequiredObservation`, `ResourceRequest`, `PhysicalActionContract`, `PreparedAction`, `ActionEvent`, `ActionOutcome`, `TimedObservation`, `ArtifactRef`, `WorldSnapshotDraft`, `WorldSnapshot`, and `JournalEvent`.
 - [ ] Implement explicit codec functions with schema versions. Do not persist `repr()` output or pickle.
 - [ ] Recursively freeze JSON mappings and sequences at record construction and thaw them only inside explicit codecs.
@@ -138,7 +144,7 @@ Goal: define immutable records and reject illegal state changes before adding st
 
 ## Phase 2: append-only mission journal
 
-Goal: provide durable ordering, immutable snapshots, effect-intent persistence, and restart reads.
+Goal: provide durable ordering, immutable snapshots, effect-intent persistence, and reliable close-and-reopen reads.
 
 ### Red
 
@@ -163,7 +169,7 @@ Goal: provide durable ordering, immutable snapshots, effect-intent persistence, 
 - [ ] Create insert-only triggers for `journal_events` and `world_snapshots`.
 - [ ] Store compact snapshot JSON and its digest in `world_snapshots`.
 - [ ] Add read APIs by mission, action, sequence range, and event type.
-- [ ] Add `verify_chain()` and call it during recovery startup.
+- [ ] Add `verify_chain()` and call it whenever the journal opens.
 - [ ] Default runtime storage beneath `STATE_DIR / "agent_runtime"`; accept an explicit path in configuration.
 
 ### Refactor and acceptance
@@ -187,7 +193,7 @@ Goal: assemble versioned snapshots from asynchronous inputs and persist large pa
 - [ ] Test that equal artifact bytes deduplicate to the same SHA-256 identifier.
 - [ ] Test that artifact metadata preserves media type, byte size, source time, and digest.
 - [ ] Test that snapshot persistence stores image references rather than image bytes.
-- [ ] Test snapshot version monotonicity across journal restart.
+- [ ] Test snapshot version monotonicity after closing and reopening the journal.
 - [ ] Test that persistence failure prevents the snapshot from being returned as admissible.
 
 ### Green
@@ -221,7 +227,7 @@ Goal: add optional managed-physical-execution metadata without changing standard
 - [ ] Test an uncontracted tool uses the ordinary dispatcher, preserves its standard tool-call ID and result message, and does not create an `ActionIntent`.
 - [ ] Test a contracted physical skill exposes every required `PhysicalActionContract` field through core `SkillInfo` without changing its model-visible tool schema.
 - [ ] Test invalid physical action contracts fail during class or module setup, before the robot can run.
-- [ ] Test a physical action contract without resources, timeout, stop handler, or verifier is rejected.
+- [ ] Test a physical action contract without resources, execution timeout, or verifier is rejected.
 - [ ] Test the physical action contract cannot redefine the standard tool name, description, argument schema, call ID, result envelope, or lifecycle.
 - [ ] Test the model-visible schema cannot override trusted contract metadata.
 - [ ] Test native and MCP dispatch resolve the same server-side physical action contract ID and version without exposing that contract in the standard model-facing schema.
@@ -235,7 +241,7 @@ Goal: add optional managed-physical-execution metadata without changing standard
 - [ ] Update `SkillsProxy` to expose skill info to `PhysicalActionContractRegistry` without reaching into private fields.
 - [ ] Keep MCP `tools/list` output backward compatible; resolve physical action contracts only in trusted server-side dispatch.
 - [ ] Implement `PhysicalActionContractRegistry` with live refresh and ambiguity detection matching `SkillsProxy` behavior.
-- [ ] Implement named predicate, verifier, and stop-handler registries owned by the harness root.
+- [ ] Implement named predicate and verifier registries owned by the harness root.
 
 ### Refactor and acceptance
 
@@ -252,9 +258,7 @@ Goal: guarantee one owner for physical resources and make all pre-dispatch gates
 - [ ] Test atomic acquisition of multiple exclusive resources.
 - [ ] Test that a conflict acquires none of the requested resources.
 - [ ] Test renew and release require the owning action ID and lease token.
-- [ ] Test an expired lease becomes unsafe and invokes the configured deadman callback; it is not silently reused.
-- [ ] Test emergency revocation works regardless of normal priority.
-- [ ] Test expiry and emergency revocation remove dispatch authority but quarantine physical resources until verified safe; neither operation makes a resource reusable.
+- [ ] Test an expired lease blocks automatic resource reuse and surfaces the owning action as unresolved; it does not invoke a generic stop or recovery workflow.
 - [ ] Test model actions cannot preempt another normal action in the prototype.
 - [ ] Test admission rejects missing and stale required observations without invoking the executor.
 - [ ] Test unrelated snapshot changes do not reject the action.
@@ -266,8 +270,8 @@ Goal: guarantee one owner for physical resources and make all pre-dispatch gates
 ### Green
 
 - [ ] Implement a harness-owned `LeaseManager` using a lock and injected monotonic clock.
-- [ ] Represent ownership with action ID, opaque token, deadline, heartbeat time, priority, and status; distinguish active, revoked, and quarantined from available.
-- [ ] Implement acquire, renew, release, snapshot, conflict, and emergency-revoke operations.
+- [ ] Represent ownership with action ID, opaque token, deadline, heartbeat time, priority, and status; distinguish active, expired, and blocked from available.
+- [ ] Implement acquire, renew, verified release, snapshot, and conflict operations.
 - [ ] Implement ordered admission gates: schema, initial snapshot, preconditions, safety, approval, lease acquisition, final snapshot revalidation, final safety.
 - [ ] Return immutable `AdmissionDecision` values with stable reason codes.
 - [ ] Journal all approval, safety, and lease transitions.
@@ -295,7 +299,7 @@ Goal: invoke skills without MCP HTTP and preserve action correlation through pro
 - [ ] Test typed action events preserve event type, progress, source time, status code, and action ID.
 - [ ] Test the legacy ToolStream adapter preserves `progressToken` correlation instead of reducing it to tool name.
 - [ ] Test uncorrelated legacy messages are operator logs and cannot settle an action.
-- [ ] Test terminal and stopped events are delivered before stream teardown.
+- [ ] Test terminal events are delivered before stream teardown.
 
 ### Green
 
@@ -305,7 +309,6 @@ Goal: invoke skills without MCP HTTP and preserve action correlation through pro
 - [ ] Extend skill call context with `action_id` while retaining MCP progress-token behavior.
 - [ ] Implement typed action event publication over the configured DIMOS transport.
 - [ ] Implement a migration adapter from ToolStream progress notifications to `ActionEvent`.
-- [ ] Include action correlation on the stopped notification used for lifecycle completion.
 - [ ] Ensure executor shutdown cancels waits, closes the remote connection, and joins owned workers.
 
 ### Refactor and acceptance
@@ -326,30 +329,24 @@ Goal: implement the complete prepared-action transaction and failure semantics.
 - [ ] Assert dispatch occurs only after `ACTION_DISPATCH_REQUESTED` is durable.
 - [ ] Assert a synchronous RPC success enters verification rather than directly settling a physical action.
 - [ ] Assert completion events with the wrong action ID are ignored and journaled as diagnostics.
-- [ ] Assert a failed verifier produces failure or recovery according to contract.
-- [ ] Assert timeout starts cancellation and does not directly release resources.
-- [ ] Assert cancellation before executor invocation settles directly and releases provisional leases; cancellation after possible invocation enters `STOPPING`.
-- [ ] Assert successful cancellation requires stop verification before `ACTION_CANCELLED` and lease release.
-- [ ] Assert failed stop verification produces `ACTION_UNKNOWN`, safety escalation, and a quarantined resource that rejects new normal actions.
+- [ ] Assert a failed verifier produces `FAILED` or `UNKNOWN` without starting a generic recovery procedure.
+- [ ] Assert an execution timeout produces `ACTION_UNKNOWN`, leaves affected resources unavailable, and does not invoke a generic stop handler.
 - [ ] Assert a lost dispatch response produces `ACTION_UNKNOWN` and no automatic retry.
 - [ ] Assert two admitted actions with disjoint resources may execute concurrently while conflicting actions cannot.
 - [ ] Assert all exit paths release nonphysical resources and close subscriptions.
-- [ ] Assert user cancellation and safety cancellation are distinguishable in the journal.
-- [ ] Assert `STOP_COMMAND_SENT` commits before the stop handler is invoked, including the journal-failure path.
-- [ ] Assert every invoked stop command records accepted, failed-before-invocation, or unknown-delivery settlement before stop verification.
-- [ ] Assert only a proven pre-invocation failure settles `FAILED`; any ambiguous RPC delivery settles `UNKNOWN` and keeps resources quarantined.
+- [ ] Assert only a proven pre-invocation failure settles `FAILED`; ambiguous RPC delivery settles `UNKNOWN` and keeps affected resources blocked.
 
 ### Green
 
 - [ ] Implement `ActionPreparer` as a pure dependency of the runner.
 - [ ] Implement `ActionRunner` with one transition function and one cleanup path.
 - [ ] Persist every state transition before publishing it to projections or UI.
-- [ ] Capture decision, admission, verification, and cancellation snapshots at the specified boundaries.
-- [ ] Monitor event source and timeout concurrently with explicit cancellation.
+- [ ] Capture decision, admission, and verification snapshots at the specified boundaries.
+- [ ] Monitor the event source and execution timeout concurrently without implementing physical cancellation.
 - [ ] Invoke verifiers through the trusted registry using a fresh snapshot.
 - [ ] Return a structured `ActionOutcome` for every terminal path.
-- [ ] Add deterministic recovery hooks, initially limited to stop-and-reconcile.
-- [ ] Ensure fatal post-dispatch journal failure revokes action authority and triggers safe-stop escalation.
+- [ ] Mark ambiguous or timed-out actions unresolved, block automatic resource reuse, and expose them to projections.
+- [ ] Ensure fatal post-dispatch journal failure revokes further dispatch authority and surfaces an unresolved fatal condition without claiming that hardware was stopped.
 
 ### Refactor and acceptance
 
@@ -358,9 +355,9 @@ Goal: implement the complete prepared-action transaction and failure semantics.
 - [ ] Run `uv run pytest dimos/agents/runtime/test_action_runner.py -v`.
 - [ ] Run `uv run mypy dimos/agents/runtime/action_runner.py`.
 
-## Phase 8: projections and restart recovery
+## Phase 8: projections and unresolved-action visibility
 
-Goal: rebuild all agent-facing state from immutable history and safely reconcile interrupted actions.
+Goal: rebuild agent-facing state from immutable history and expose interrupted actions without implementing controller reconciliation.
 
 ### Red
 
@@ -370,25 +367,24 @@ Goal: rebuild all agent-facing state from immutable history and safely reconcile
 - [ ] Test the LLM projection includes goal, constraints, snapshot version, relevant observations, active actions, resources, salient events, unknown effects, and decision question.
 - [ ] Test deterministic event replay produces byte-equivalent canonical projection output.
 - [ ] Delete projection checkpoints and test that replay rebuilds the same state.
-- [ ] Test restart identifies `DISPATCHING`, `EXECUTING`, `VERIFYING`, and `STOPPING` actions as unresolved.
-- [ ] Test unresolved `NEVER_IF_UNKNOWN` actions are not dispatched again.
-- [ ] Test reconciliation queries current state, requests stop where required, captures a recovery snapshot, and appends a terminal or unknown outcome.
+- [ ] Test reopening the journal identifies `DISPATCHING`, `EXECUTING`, and `VERIFYING` actions as unresolved.
+- [ ] Test recorded unresolved actions are exposed and never automatically dispatched again.
+- [ ] Test projection rebuilding performs no controller query, stop request, outcome reconciliation, or physical-command replay.
 - [ ] Test corrupted journal startup fails before any executor is available.
 
 ### Green
 
-- [ ] Implement pure fold functions for mission, active-action, lease, recovery, and LLM projections.
+- [ ] Implement pure fold functions for mission, active-action, lease, unresolved-action, and LLM projections.
 - [ ] Implement deterministic salience and progress-coalescing rules.
 - [ ] Add optional rebuildable projection checkpoints only after replay behavior passes.
-- [ ] Implement `RecoveryManager` owned by the harness lifecycle root.
-- [ ] Block conflicting new actions until recovery reconciliation finishes.
+- [ ] Mark recorded unresolved commands as non-dispatchable without attempting to settle them.
 - [ ] Expose unresolved and unknown actions in both operator and model projections.
 
 ### Refactor and acceptance
 
 - [ ] Ensure projections never perform robot I/O or append journal events.
-- [ ] Run `uv run pytest dimos/agents/runtime/test_projections.py dimos/agents/runtime/test_recovery.py -v`.
-- [ ] Run `uv run mypy dimos/agents/runtime/projections.py dimos/agents/runtime/recovery.py`.
+- [ ] Run `uv run pytest dimos/agents/runtime/test_projections.py -v`.
+- [ ] Run `uv run mypy dimos/agents/runtime/projections.py`.
 
 ## Phase 9: model loop and harness lifecycle
 
@@ -401,15 +397,15 @@ Goal: integrate the runtime with a bounded model decision loop while keeping dur
 - [ ] Test a contracted physical tool call becomes one `ActionIntent` tied to the decision snapshot and the unchanged standard tool-call ID.
 - [ ] Test physical tool wrappers call `ActionRunner`, never `SkillsProxy` directly.
 - [ ] Test a physical `ActionOutcome` is encoded into a standard tool-result message associated with the original tool-call ID rather than returned as raw controller prose.
-- [ ] Test a safety or unknown event wakes the model only after deterministic handling completes.
+- [ ] Test a safety or unknown event is surfaced to the model without initiating generic cancellation or recovery.
 - [ ] Test routine progress does not trigger an LLM turn.
 - [ ] Test user steering can cancel a model turn without falsely marking a robot action stopped.
-- [ ] Test harness startup performs recovery before accepting new mission input.
-- [ ] Test harness shutdown cancels model work, stops or hands off active actions according to policy, then closes subscriptions and stores.
+- [ ] Test harness startup exposes recorded unresolved actions and does not automatically redispatch them.
+- [ ] Test harness shutdown cancels model work and closes subscriptions and stores without claiming that active physical actions were stopped.
 
 ### Green
 
-- [ ] Implement `RobotAgentHarness` as the root owner of model adapter, standard tool dispatcher, journal, snapshot provider, physical action contracts, leases, executor, runner, projections, and recovery.
+- [ ] Implement `RobotAgentHarness` as the root owner of model adapter, standard tool dispatcher, journal, snapshot provider, physical action contracts, leases, executor, runner, and projections.
 - [ ] Implement `RobotAgentHarnessModule` as the sole coordinator-visible lifecycle owner of one `RobotAgentHarness` and the `ActionRuntimeSpec` RPC implementation.
 - [ ] Reuse LangGraph or the existing model abstraction only as the bounded decision loop; do not use chat history as mission state.
 - [ ] Generate standard model tools from native skill discovery without changing their schemas; wrap only tools with a `PhysicalActionContract` using `ActionRunner`.
@@ -429,16 +425,15 @@ Goal: integrate the runtime with a bounded model decision loop while keeping dur
 
 ## Phase 10: migrate navigation as the vertical slice
 
-Goal: demonstrate a real DIMOS physical skill whose resource lifetime matches controller lifetime.
+Goal: demonstrate a real DIMOS physical skill whose resource ownership spans dispatch through verified completion.
 
 ### Red
 
 - [ ] Reproduce the existing issue where `navigate_with_text` releases movement after `set_goal()` returns.
-- [ ] Test the migrated `PhysicalActionContract` declares exclusive base movement, freshness bounds, timeout, stop handler, verifier, and `NEVER_IF_UNKNOWN` replay.
+- [ ] Test the migrated `PhysicalActionContract` declares exclusive base movement, freshness bounds, execution timeout, and verifier.
 - [ ] Test tagged-location and semantic-map navigation return a correlated background action rather than claiming completion.
 - [ ] Test goal-reached produces a correlated completion report.
 - [ ] Test navigation success is verified from a fresh pose and zero-motion or idle-controller evidence.
-- [ ] Test `stop_navigation` produces a stop event and only releases movement after stopped state is observed.
 - [ ] Test follow, patrol, or exploration cannot acquire movement while navigation is executing.
 - [ ] Test stale odometry rejects navigation before `set_goal()`.
 
@@ -446,7 +441,7 @@ Goal: demonstrate a real DIMOS physical skill whose resource lifetime matches co
 
 - [ ] Add action ID propagation from the runner context into `NavigationSkillContainer`.
 - [ ] Refactor `navigate_with_text` so starting a goal has a background lifecycle for every asynchronous path.
-- [ ] Emit typed navigation started, progress where meaningful, completion, failure, and stopped events.
+- [ ] Emit typed navigation started, progress where meaningful, completion, and failure events.
 - [ ] Preserve the existing user-visible tool name, schema, call ID, and MCP result behavior.
 - [ ] Add a trusted navigation verifier that checks controller state and target tolerance using a fresh snapshot.
 - [ ] Route migrated movement ownership through `LeaseManager` and disable duplicate `CapabilityRegistry` acquisition for both native and MCP contracted action paths.
@@ -503,20 +498,12 @@ Create `dimos/e2e_tests/test_agent_runtime_replay.py`. Mark tests that require L
 - [ ] Assert progress is coalesced for model context but fully available in the operator timeline.
 - [ ] Assert the final outcome is physically verified from the replayed pose, not from the controller report alone.
 
-### E2E D: crash recovery without duplicate dispatch
-
-- [ ] Start the harness with a persistent test journal and dispatch a scripted background action.
-- [ ] Terminate only the harness after `ACTION_DISPATCH_REQUESTED` and controller acceptance, leaving an unresolved journal state.
-- [ ] Restart against the same database and a controller adapter reporting that the action may still be active.
-- [ ] Assert recovery runs before new input, requests stop, verifies stopped state, and appends reconciliation events.
-- [ ] Assert the original skill invocation count remains exactly one.
-- [ ] Assert the outcome is `CANCELLED` when stop is proven and `UNKNOWN` with a quarantined movement resource in the fault-injected no-acknowledgement variant.
-
-### E2E E: projection rebuild
+### E2E D: projection rebuild
 
 - [ ] Delete only `projection_checkpoints` after the replay mission.
 - [ ] Reopen the journal and rebuild all projections.
-- [ ] Assert canonical mission, action, lease, recovery, and LLM projections equal those captured before shutdown.
+- [ ] Assert canonical mission, action, lease, unresolved-action, and LLM projections equal those captured before shutdown.
+- [ ] Assert projection rebuilding performs no skill invocation or physical-command replay.
 
 Replay acceptance commands:
 
@@ -553,12 +540,10 @@ The following cases must be covered before declaring the prototype complete:
 | Resource conflict | Lease acquisition | Only one action owns movement |
 | Journal failure | Before dispatch | No physical call occurs |
 | Lost RPC response | Immediately after executor receives call | Outcome unknown; no automatic retry |
-| Controller failure | During execution | Structured failure and bounded recovery |
-| Progress disconnect | While action runs | Controller reconciliation begins |
-| Execution timeout | No terminal event | Stop protocol begins; lease remains held |
-| Stop timeout | No zero-motion evidence | Safety escalation and unknown outcome |
+| Controller failure | During execution | Structured failure or unknown outcome; no generic recovery starts |
+| Progress disconnect | While action runs | Outcome unknown unless another trusted completion source proves it |
+| Execution timeout | No terminal event | Outcome unknown; affected resources remain unavailable; no generic cancellation starts |
 | Verification mismatch | Controller claims success at wrong pose | Action does not succeed |
-| Harness crash | After dispatch, before settlement | Restart reconciles; invocation count remains one |
 | Corrupt journal | Before startup | Startup fails before skill dispatch is available |
 | Artifact write failure | During snapshot capture | Snapshot is not admissible or journaled as complete |
 
@@ -577,14 +562,13 @@ Correctness:
 - [ ] Every physical effect has a durable pre-effect intent.
 - [ ] Every action and event is correlated by action ID.
 - [ ] Every success has verifier evidence and a verification snapshot.
-- [ ] Every cancellation has stop evidence or an unknown-state escalation.
 - [ ] Relevant observation freshness is checked after waits.
-- [ ] Recovery never blind-replays an uncertain physical command.
+- [ ] Unresolved physical commands remain visible and are never automatically redispatched.
 
 Persistence:
 
 - [ ] Journal and snapshots reject update and delete.
-- [ ] Hash-chain validation runs on recovery startup.
+- [ ] Hash-chain validation runs whenever the journal opens.
 - [ ] Snapshot and capture event are atomic.
 - [ ] Large artifacts are referenced, not embedded.
 - [ ] Projection checkpoints are disposable and rebuildable.
@@ -602,4 +586,4 @@ Testing:
 
 For a time-bounded implementation, the first reviewable milestone is Phases 0 through 8, Phase 11, and E2E A through D. That milestone demonstrates the design with a scripted physical skill but is not the final definition of done. The completed prototype also includes the production navigation migration in Phase 10; if it cannot be completed safely within the time box, leave its checklist open and describe the submission as a vertical runtime prototype rather than a finished DIMOS integration.
 
-Do not cut journal durability, stale-state rejection, verified cancellation, or crash recovery to add UI polish. Those behaviors are the robotics-specific value of the prototype.
+Do not cut journal durability, stale-state rejection, resource ownership, or physical verification to add UI polish. Cancellation and restart recovery are explicitly separate workstreams built on the durable records and action identity established here.
