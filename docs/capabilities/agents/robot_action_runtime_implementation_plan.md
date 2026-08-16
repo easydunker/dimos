@@ -536,7 +536,7 @@ Goal: leave a reviewable prototype with reproducible evidence.
 - [ ] Run `md-babel-py run docs/capabilities/agents/robot_action_runtime_spec.md --dry-run` and the same command for this plan.
 - [ ] Regenerate `dimos/robot/all_blueprints.py` with `pytest dimos/robot/test_all_blueprints_generation.py` if a runnable built-in blueprint was added.
 - [ ] Document the exact passing commands and any excluded platform-specific tests in the final handoff.
-- [ ] Capture one example mission journal and render its action timeline for the take-home demonstration.
+- [ ] Capture one example mission journal and render its action timeline for the final demonstration.
 
 ## Required fault-injection matrix
 
@@ -596,6 +596,6 @@ Testing:
 
 ## Recommended delivery order
 
-For a time-bounded take-home, the first reviewable milestone is Phases 0 through 8, Phase 11, and E2E A through D. That milestone demonstrates the design with a scripted physical skill but is not the final definition of done. The completed prototype also includes the production navigation migration in Phase 10; if it cannot be completed safely within the time box, leave its checklist open and describe the submission as a vertical runtime prototype rather than a finished DIMOS integration.
+For a time-bounded implementation, the first reviewable milestone is Phases 0 through 8, Phase 11, and E2E A through D. That milestone demonstrates the design with a scripted physical skill but is not the final definition of done. The completed prototype also includes the production navigation migration in Phase 10; if it cannot be completed safely within the time box, leave its checklist open and describe the submission as a vertical runtime prototype rather than a finished DIMOS integration.
 
 Do not cut journal durability, stale-state rejection, verified cancellation, or crash recovery to add UI polish. Those behaviors are the robotics-specific value of the prototype.

@@ -6,7 +6,7 @@ title: "Robot Action Runtime Specification"
 
 Status: proposed prototype specification.
 
-Audience: implementers of the DIMOS agent harness, robot skill authors, and reviewers of the robotics agent-harness take-home.
+Audience: implementers of the DIMOS agent harness, robot skill authors, and reviewers of the robotics agent harness.
 
 The companion [implementation plan](/docs/capabilities/agents/robot_action_runtime_implementation_plan.md) is the authoritative work breakdown and progress checklist.
 
